@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="cs">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Ruined Temple TD – WebGL</title>
+    <link rel="icon" href="/map/preview.png" />
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="view"></canvas>
+      <div id="float-layer"></div>
+      <div id="drag-box" hidden></div>
+      <div id="fade"></div>
+
+      <div id="topbar">
+        <div class="res" title="Gold"><span class="gold-icon"></span><span id="gold">0</span></div>
+        <div class="res" title="Lives"><span class="life-icon">♥</span><span id="lives">0</span></div>
+        <div class="res" id="clock"></div>
+        <div class="spacer"></div>
+        <button id="btn-speed" title="Game speed">1×</button>
+        <button id="btn-music" title="Music" hidden>♫</button>
+        <button id="btn-pause" title="Pause (Pause/F10)">❚❚</button>
+        <button id="btn-regions" title="Regions &amp; creep path (F2)">Regions</button>
+        <button id="btn-pathing" title="Pathing map overlay (F3)">Pathing</button>
+        <button id="btn-quests" title="Quests (F9)">Quests</button>
+        <button id="btn-help" title="Help (F1)">?</button>
+      </div>
+
+      <div id="multiboard" hidden>
+        <div class="mb-title" id="mb-title"></div>
+        <table id="mb-table"></table>
+      </div>
+
+      <div id="messages"></div>
+
+      <div id="bottom">
+        <div id="minimap-wrap"><canvas id="minimap" width="256" height="256"></canvas></div>
+        <div id="info"></div>
+        <div id="card"></div>
+      </div>
+
+      <div id="tooltip" hidden></div>
+      <div id="dialog" hidden></div>
+      <div id="modal" hidden></div>
+      <div id="loading">Načítám mapu…</div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

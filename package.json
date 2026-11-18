@@ -1,0 +1,30 @@
+{
+  "name": "ruined-temple-td",
+  "version": "1.0.0",
+  "description": "Ruined Temple TD (Warcraft III map) replica in three.js",
+  "scripts": {
+    "extract": "tsx tools/extract.ts",
+    "assets": "tsx tools/assets.ts",
+    "report": "tsx tools/report.ts",
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "three": "^0.187.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/pngjs": "^6.0.5",
+    "@types/three": "^0.187.0",
+    "@wowserhq/stormjs": "^0.4.1",
+    "mdx-m3-viewer": "^5.12.0",
+    "pngjs": "^7.0.0",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.8"
+  },
+  "private": true,
+  "type": "module"
+}
