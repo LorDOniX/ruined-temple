@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { clone as cloneSkinned } from 'three/examples/jsm/utils/SkeletonUtils.js';
 import type { Unit } from '../game/game';
-import { applyTeamColor, pickPortraitSequence, type ModelCamera, type Wc3Assets } from './mdx';
+import { applyTeamColor, pickPortraitSequence, type ModelCamera, type Wc3Assets, startGlobalClips } from './mdx';
 
 /**
  * The animated unit portrait of the console: "<model>_portrait.mdx" (or the unit model itself) playing its
@@ -50,6 +50,7 @@ export class PortraitView {
       if (info?.sequences.length) {
         const seq = pickPortraitSequence(info.sequences, tags);
         this.mixer = new THREE.AnimationMixer(m);
+        startGlobalClips(this.mixer, info);
         this.mixer.clipAction(seq.clip).setLoop(THREE.LoopRepeat, Infinity).play();
         m.traverse((o) => {
           if ((o as THREE.Mesh).isMesh && o.name in seq.visibility) o.visible = seq.visibility[o.name];

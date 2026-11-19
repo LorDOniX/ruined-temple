@@ -1,11 +1,13 @@
 import * as THREE from 'three';
-import type { MapData } from '../data/types';
+import type { AssetCatalog, MapData } from '../data/types';
 import type { ObjectDB } from '../data/objects';
 import { CREEP_PLAYER, PLAYER_COLORS, attackColor, type Destructable, type Game, type Missile, type Unit } from '../game/game';
 import { TerrainGrid } from './terrain';
 import { clone as cloneSkinned } from 'three/examples/jsm/utils/SkeletonUtils.js';
-import { Wc3Assets, applyReplaceable, applyTeamColor, instantiate, pickSequence, type ModelAnimations, type SequenceInfo } from './mdx';
-import { ParticleSystem } from './particles';
+import { MaterialAnimator, Wc3Assets, startGlobalClips, applyReplaceable, applyTeamColor, instantiate, pickSequence, type ModelAnimations, type SequenceInfo } from './mdx';
+import { ParticleSystem, type ModelEvent } from './particles';
+import { DecalLayer, type Decal } from './decals';
+import type { SoundPlayer } from '../sound';
 import {
   auraTowerPlaceholder,
   builderPlaceholder,
@@ -26,6 +28,9 @@ interface UnitView {
   hpBg: THREE.Sprite;
   hpFg: THREE.Sprite;
   selection: THREE.Mesh;
+  /** Selection circle (ReplaceableTextures\Selection) and blob shadow on the ground (null without game assets). */
+  circle: Decal | null;
+  shadow: Decal | null;
   height: number;
   defId: string;
   baseScale: number;
@@ -46,12 +51,23 @@ interface UnitAnim {
 
 interface MissileView {
   obj: THREE.Group;
+  /** The model's short "birth" sequence (launch sound) plays first, then "stand" while flying. */
+  phase: 'birth' | 'stand' | 'death';
   /** Animation state shared with the particle emitters (stand while flying, death at impact). */
   state: { seq: SequenceInfo | null; action: THREE.AnimationAction | null };
   mixer: THREE.AnimationMixer | null;
   info: ModelAnimations | null;
   last: THREE.Vector3 | null;
   owner: number;
+}
+
+interface AnimatedProp {
+  mixer: THREE.AnimationMixer;
+  info: ModelAnimations;
+  root: THREE.Object3D;
+  seq: SequenceInfo | null;
+  action: THREE.AnimationAction | null;
+  current: string;
 }
 
 const tmpV = new THREE.Vector3();
@@ -62,15 +78,32 @@ export class WorldView {
   private units = new Map<number, UnitView>();
   private missiles = new Map<number, MissileView>();
   readonly particles: ParticleSystem;
+  /** Animated material layers (water flipbooks, scrolling textures, alpha) of all model instances. */
+  readonly matAnim = new MaterialAnimator();
+  /** Splats, ubersplats, shadows and selection circles (only with game assets). */
+  readonly decals: DecalLayer | null;
+  /** Sounds of model event objects (SND) and weapon impacts. */
+  sound: SoundPlayer | null = null;
+  /** Ubersplats under buildings (unit field "uubs"), faded out once the building is gone. */
+  private uberSplats = new Map<number, { unit: Unit; release: () => void }>();
   private hover: { el: HTMLElement; unit: Unit; bar: HTMLElement } | null = null;
   private effects: { obj: THREE.Object3D; until: number; start: number; kind: 'ring' | 'line' | 'model'; mixer?: THREE.AnimationMixer; game?: boolean }[] = [];
   private destructables = new Map<string, THREE.Group>();
+  private destructableProps = new Map<string, AnimatedProp>();
+  /** Animated doodads and destructables. */
+  private props: AnimatedProp[] = [];
+  private bolts: { mesh: THREE.Mesh; a: THREE.Vector3; b: THREE.Vector3; segs: number; def: NonNullable<AssetCatalog['lightnings']>[string]; start: number; life: number; jitter: number[][]; nextJitter: number; linkId?: number; follow?: { from: Unit; to: Unit } }[] = [];
+  /** Buff art attached to unit models, by unit and buff id. */
+  private buffArts = new Map<number, Map<string, THREE.Object3D[]>>();
   private spawnPortal: THREE.Object3D[] = [];
   private regionsGroup = new THREE.Group();
   readonly ghost = new THREE.Group();
   private ghostCells: THREE.InstancedMesh;
   private ghostModel: THREE.Object3D | null = null;
   private ghostId = '';
+  private planned = new Map<string, THREE.Object3D>();
+  /** Player whose planned buildings are shown. */
+  localPlayer = 0;
   /** Currently selected units (selection circles). */
   selection = new Set<Unit>();
   /** Health bars above all units – like the game, only while Alt is held. */
@@ -80,6 +113,8 @@ export class WorldView {
   private floatLayer: HTMLElement;
   private floats: { el: HTMLElement; x: number; y: number; z: number; start: number; life: number }[] = [];
   private clock = 0;
+  /** Game time seen by the renderer (stops while paused, follows the game speed). */
+  private gclock = 0;
 
   constructor(
     scene: THREE.Scene,
@@ -104,13 +139,29 @@ export class WorldView {
 
     this.floatLayer = overlayRoot;
     this.particles = new ParticleSystem(this.world);
+    this.particles.onEvent = (e) => this.modelEvent(e);
+    this.decals = assets?.catalog.ui ? new DecalLayer(this.world, (x, y) => this.grid.heightAt(x, y), (p) => assets.loadTexture(p)) : null;
 
     game.on('unitAdded', (u) => this.addUnit(u));
     game.on('unitRemoved', (u) => this.removeUnit(u));
     game.on('missileAdded', (m) => this.addMissile(m));
-    game.on('effect', (e) => this.ring(e.x, e.y, e.color));
-    game.on('lightning', (e) => this.lightning(e.from, e.to, e.color));
+    game.on('effect', (e) => {
+      const path = e.model.replace(/\.md[lx]$/i, '');
+      if (this.assets?.modelExists(path)) this.spawnModel(path, e.x, e.y, this.grid.heightAt(e.x, e.y), 0);
+      else this.ring(e.x, e.y, e.color);
+    });
+    game.on('buff', (e) => this.buffArt(e.unit, e.id, e.on));
+    game.on('spellArt', (e) => {
+      if (e.sound) this.sound?.playLabel(e.sound, { x: e.x, y: e.y });
+      const path = e.model.replace(/\.md[lx]$/i, '');
+      if (!path) return;
+      const storm = e.unit ? 0 : 20;
+      this.spawnModel(path, e.x, e.y, this.grid.heightAt(e.x, e.y) + (e.unit?.fly ?? 0), 0, 'birth', storm);
+    });
+    game.on('link', (e) => this.link(e.id, e.from, e.to, e.lightning, e.until));
+    game.on('lightning', (e) => this.lightning(e.from, e.to, e.color, e.model));
     game.on('floatText', (e) => this.floatText(e.text, e.x, e.y, e.color, e.lifespan));
+    game.on('combatHit', (e) => this.sound?.playLabel(`${e.weaponSound}${e.armor}`, { x: e.x, y: e.y }));
     game.on('doodadAnim', (e) => {
       if (e.id === 'D004') this.spawnPortal.forEach((o) => (o.visible = e.anim === 'birth'));
     });
@@ -143,7 +194,11 @@ export class WorldView {
       if (id === 'D004') this.spawnPortal.push(inst);
       void this.upgradeDoodad(id, variation, matrices, inst);
     }
-    for (const d of Object.values(this.game.destructables)) this.addDestructable(d);
+  }
+
+  /** Gates, portcullises and the portal – they exist once the game has started (Game.start creates them). */
+  buildDestructables() {
+    for (const d of Object.values(this.game.destructables)) if (!this.destructables.has(d.variable)) this.addDestructable(d);
   }
 
   private async upgradeDoodad(id: string, variation: number, matrices: THREE.Matrix4[], placeholder: THREE.Object3D) {
@@ -151,13 +206,27 @@ export class WorldView {
     const info = this.db.doodadModel(id);
     if (!info) return;
     const path = info.numVar > 1 ? `${info.file}${Math.min(variation, info.numVar - 1)}` : info.file;
-    let model = (await this.assets.loadModel(path)) ?? (await this.assets.loadModel(info.file));
-    if (!model) return;
+    const template = (await this.assets.loadModel(path)) ?? (await this.assets.loadModel(info.file));
+    if (!template) return;
+    let model = template;
     if (info.texId && info.texFile) {
       model = model.clone();
       await applyReplaceable(this.assets, model, info.texId, info.texFile);
     }
-    const inst = instantiate(model, matrices);
+    let inst: THREE.Object3D;
+    if (this.isAnimated(template)) {
+      // Moving parts / emitters (fires, smoke, flies, totems): individual animated copies with a random phase.
+      inst = new THREE.Group();
+      for (const mtx of matrices) {
+        const c = cloneSkinned(model);
+        c.applyMatrix4(mtx);
+        inst.add(c);
+        this.animatedProp(template, c, true);
+      }
+    } else {
+      inst = instantiate(model, matrices);
+      this.matAnim.register(inst, null, model.userData.globals ?? []);
+    }
     inst.visible = placeholder.visible;
     this.world.add(inst);
     this.world.remove(placeholder);
@@ -182,8 +251,59 @@ export class WorldView {
         if (info.texId && info.texFile) await applyReplaceable(this.assets!, m, info.texId, info.texFile);
         g.clear();
         g.add(m);
+        const p = this.animatedProp(model, m, false);
+        if (p) this.destructableProps.set(d.variable, p);
+        else this.matAnim.register(m, null, model.userData.globals ?? []);
       }
     })();
+  }
+
+  /** Whether a doodad model moves in its stand sequence or carries emitters / ribbons / event objects. */
+  private isAnimated(template: THREE.Object3D) {
+    const u = template.userData;
+    if ((u.emitters2?.length ?? 0) + (u.ribbons?.length ?? 0) + (u.events?.length ?? 0) > 0) return true;
+    const info = this.assets?.animations(template);
+    const seq = info && pickSequence(info.sequences, 'stand');
+    if (!seq) return false;
+    return seq.clip.tracks.some((t) => {
+      const n = t.getValueSize();
+      for (let i = n; i < t.values.length; i++) if (Math.abs(t.values[i] - t.values[i % n]) > 1e-3) return true;
+      return false;
+    });
+  }
+
+  /** Animated doodad / destructable: own mixer (looping stand), particle emitters, events, material animations. */
+  private animatedProp(template: THREE.Object3D, root: THREE.Object3D, randomPhase: boolean): AnimatedProp | null {
+    const info = this.assets?.animations(template);
+    if (!info) return null;
+    const p: AnimatedProp = { mixer: new THREE.AnimationMixer(root), info, root, seq: null, action: null, current: '' };
+    this.playProp(p, 'stand');
+    if (randomPhase && p.action && p.seq) p.action.time = Math.random() * p.seq.duration;
+    const frame = () => (p.seq && p.action ? { interval: p.seq.interval, frame: p.seq.interval[0] + p.action.time * 1000 } : null);
+    this.particles.attach(root, template, frame, info.globals);
+    this.matAnim.register(root, frame, template.userData.globals ?? []);
+    this.props.push(p);
+    return p;
+  }
+
+  private playProp(p: AnimatedProp, name: string) {
+    const seq = pickSequence(p.info.sequences, name) ?? (name === 'stand' ? p.info.sequences[0] : undefined);
+    p.current = name;
+    if (!seq) return false;
+    p.mixer.stopAllAction();
+    startGlobalClips(p.mixer, p.info);
+    const action = p.mixer.clipAction(seq.clip);
+    action.reset();
+    const once = name !== 'stand';
+    action.setLoop(once ? THREE.LoopOnce : THREE.LoopRepeat, Infinity);
+    action.clampWhenFinished = once;
+    action.play();
+    p.seq = seq;
+    p.action = action;
+    p.root.traverse((o) => {
+      if ((o as THREE.Mesh).isMesh && o.name in seq.visibility) o.visible = seq.visibility[o.name];
+    });
+    return true;
   }
 
   private buildRegions() {
@@ -264,7 +384,8 @@ export class WorldView {
     root.add(body);
     const sel = ringMesh(Math.max(30, u.def.selectionScale * 36), u.owner === CREEP_PLAYER ? 0xff3030 : 0x30ff30);
     sel.visible = false;
-    root.add(sel);
+    if (!this.decals) root.add(sel);
+    const { circle, shadow } = this.groundDecals(u);
     const hpBg = new THREE.Sprite(this.hpMatBg);
     hpBg.center.set(0.5, 0.5);
     const hpFg = new THREE.Sprite(this.hpMats[2]);
@@ -273,7 +394,7 @@ export class WorldView {
     root.add(hpBg, hpFg);
     const baseScale = 1;
     this.world.add(root);
-    const view: UnitView = { root, body, hpBg, hpFg, selection: sel, height, defId: u.def.id, baseScale, anim: null };
+    const view: UnitView = { root, body, hpBg, hpFg, selection: sel, circle, shadow, height, defId: u.def.id, baseScale, anim: null };
     this.units.set(u.uid, view);
     void this.upgradeUnit(u, view);
   }
@@ -294,7 +415,13 @@ export class WorldView {
     const info = this.assets.animations(model);
     const anim: UnitAnim = { model: m, mixer: info ? new THREE.AnimationMixer(m) : null, info, current: '', seq: null, action: null, lastAnimTime: 0 };
     view.anim = anim;
-    if (info) this.particles.attach(m, model, () => (anim.seq && anim.action ? { interval: anim.seq.interval, frame: anim.seq.interval[0] + anim.action.time * 1000 } : null), info.globals);
+    const frame = () => (anim.seq && anim.action ? { interval: anim.seq.interval, frame: anim.seq.interval[0] + anim.action.time * 1000 } : null);
+    if (info) this.particles.attach(m, model, frame, info.globals);
+    this.matAnim.register(m, frame, model.userData.globals ?? []);
+    // Art of the model's abilities and of buffs it already has (the model may load after the buff was applied).
+    this.permanentArt(u);
+    this.buffArts.delete(u.uid);
+    for (const id of Object.keys(u.buffs)) this.buffArt(u, id, true);
   }
 
   /** Plays the unit's current animation with the matching MDX sequence (animation tags from the "uani" field). */
@@ -309,6 +436,7 @@ export class WorldView {
     a.current = name;
     if (!seq) return;
     a.mixer.stopAllAction();
+    startGlobalClips(a.mixer, a.info);
     const action = a.mixer.clipAction(seq.clip);
     action.reset();
     const once = name === 'attack' || name === 'death' || name === 'birth' || seq.nonLooping;
@@ -316,7 +444,8 @@ export class WorldView {
     action.clampWhenFinished = once;
     action.timeScale = 1;
     if (name === 'walk' && seq.moveSpeed > 0) action.timeScale = Math.max(0.2, (u.speed * (u.slow ? 1 - u.slow.move : 1)) / seq.moveSpeed);
-    if (name === 'birth' && u.constructing) action.timeScale = seq.duration / Math.max(0.1, u.constructing.total);
+    // Construction: the birth sequence follows the construction progress (it stops while no builder works).
+    if (name === 'birth' && u.constructing) action.timeScale = 0;
     action.play();
     a.seq = seq;
     a.action = action;
@@ -338,14 +467,176 @@ export class WorldView {
     } else if (wanted === 'walk' && a.action && a.seq && a.seq.moveSpeed > 0) {
       a.action.timeScale = Math.max(0.2, (u.speed * (u.slow ? 1 - u.slow.move : 1)) / a.seq.moveSpeed);
     }
+    if (wanted === 'birth' && u.constructing && a.action && a.seq) a.action.time = a.seq.duration * Math.min(0.999, u.constructing.elapsed / Math.max(0.1, u.constructing.total));
     a.mixer.update(dt);
+  }
+
+  /**
+   * Ground decals of a unit like the game: selection circle texture by size (ussc × ScaleFactor, UI\MiscData.txt),
+   * coloured friend / enemy / neutral; blob shadow image (ushu) placed by ushx / ushy / ushw / ushh; and the
+   * ubersplat under buildings (uubs), which fades in during construction and out after the building is gone.
+   */
+  private groundDecals(u: Unit): { circle: Decal | null; shadow: Decal | null } {
+    const ui = this.assets?.catalog.ui;
+    if (!this.decals || !ui) return { circle: null, shadow: null };
+    const size = u.def.selectionScale * ui.selectionScale;
+    const tex = ui.selectionCircles.find((c) => size <= c.maxSize) ?? ui.selectionCircles[ui.selectionCircles.length - 1];
+    const argb = u.owner === CREEP_PLAYER ? ui.selectionColors.enemy : u.owner < CREEP_PLAYER ? ui.selectionColors.friend : ui.selectionColors.neutral;
+    const lin = (c: number) => Math.pow(c / 255, 2.2);
+    const circle = this.decals.add({ x: u.x, y: u.y, halfW: size / 2, halfH: size / 2, layer: 3, visible: false, color: [lin(argb[1]), lin(argb[2]), lin(argb[3]), argb[0] / 255] }, tex?.texture);
+    let shadow: Decal | null = null;
+    const f = u.def.fields;
+    const image = String(f.ushu ?? '').trim();
+    const w = Number(f.ushw) || 0;
+    const h = Number(f.ushh) || 0;
+    if (image && w > 0 && h > 0) {
+      const sc = ui.shadowColor;
+      shadow = this.decals.add({ x: u.x, y: u.y, halfW: w / 2, halfH: h / 2, layer: 2, color: [lin(sc[1]), lin(sc[2]), lin(sc[3]), sc[0] / 255] }, `ReplaceableTextures\\Shadows\\${image}`);
+      shadow.cache = undefined;
+    }
+    const ubr = String(f.uubs ?? '').trim();
+    const def = ubr ? this.assets?.catalog.uberSplats?.[ubr] : undefined;
+    if (def && !this.uberSplats.has(u.uid)) this.uberSplats.set(u.uid, { unit: u, release: this.decals.uberSplat(def, u.x, u.y, true).release });
+    return { circle, shadow };
   }
 
   private removeUnit(u: Unit) {
     const v = this.units.get(u.uid);
     if (!v) return;
     this.world.remove(v.root);
+    if (v.circle) this.decals?.remove(v.circle);
+    if (v.shadow) this.decals?.remove(v.shadow);
     this.units.delete(u.uid);
+    this.buffArts.delete(u.uid);
+  }
+
+  /** Art of a buff: map buffs (w3h ftat / fta0) or the game's profile (Targetart / Targetattach). */
+  private buffDef(id: string): { art: string[]; attach: string[] } | null {
+    const custom = this.map.objects.w3h?.[id];
+    const ftat = custom?.fields.ftat;
+    if (ftat) {
+      const art = String(ftat).split(',').filter(Boolean);
+      return { art, attach: art.map((_, i) => String(custom.fields[`fta${i}`] ?? custom.fields.fta0 ?? '')) };
+    }
+    const c = this.assets?.catalog.buffs?.[id] ?? (custom ? this.assets?.catalog.buffs?.[custom.base] : undefined);
+    return c && c.targetArt.length ? { art: c.targetArt, attach: c.targetAttach } : null;
+  }
+
+  private buffArt(u: Unit, id: string, on: boolean) {
+    let arts = this.buffArts.get(u.uid);
+    if (!on) {
+      for (const o of arts?.get(id) ?? []) o.parent?.remove(o);
+      arts?.delete(id);
+      return;
+    }
+    const def = this.buffDef(id);
+    if (!def) return;
+    if (!arts) this.buffArts.set(u.uid, (arts = new Map()));
+    const list: THREE.Object3D[] = [];
+    arts.set(id, list);
+    def.art.forEach((path, i) => void this.attachArt(u, path, def.attach[i] ?? def.attach[0] ?? '').then((o) => o && (arts!.get(id) === list ? list.push(o) : o.parent?.remove(o))));
+  }
+
+  /**
+   * Attaches an effect model to an attachment point of a unit's model ("hand,left" → "Hand Left Ref", "overhead",
+   * "chest", "sprite,first" …); without such a point it sits at the origin / above the unit. The effect loops its
+   * stand sequence and follows the unit's animation.
+   */
+  private async attachArt(u: Unit, path: string, tags: string): Promise<THREE.Object3D | null> {
+    const file = path.replace(/\.md[lx]$/i, '');
+    if (!this.assets?.modelExists(file)) return null;
+    const template = await this.assets.loadModel(file);
+    const v = this.units.get(u.uid);
+    if (!template || !v || !u.alive) return null;
+    const words = tags.toLowerCase().split(/[\s,]+/).filter(Boolean);
+    let parent: THREE.Object3D = v.body;
+    let z = 0;
+    const model = v.anim?.model;
+    const points = (model?.userData.attachments as { words: string[]; node: string }[] | undefined) ?? [];
+    const want = words.length ? words : ['origin'];
+    const point = points.find((p) => want.every((w) => p.words.includes(w))) ?? (want[0] === 'origin' ? undefined : points.find((p) => p.words.includes(want[0])));
+    if (model && point) {
+      model.traverse((o) => {
+        if ((o as THREE.Bone).isBone && o.name === point.node) parent = o;
+      });
+    } else if (want.includes('overhead') || want.includes('head')) z = v.height + 10;
+    else if (want.includes('chest')) z = v.height * 0.6;
+    const fx = cloneSkinned(template);
+    fx.position.z = z;
+    // Bones carry the unit's model scale; effects keep their own size.
+    if (parent !== v.body) fx.scale.setScalar(1 / Math.max(0.1, u.def.scale));
+    parent.add(fx);
+    this.animatedProp(template, fx, false);
+    return fx;
+  }
+
+  /** Art of abilities that is always shown on the unit (Asp3 "Sphere": orbs circling the Water Spirit). */
+  private permanentArt(u: Unit) {
+    for (const id of u.def.abilities) {
+      const ab = this.db.ability(id);
+      if (!/^Asp/.test(ab.base)) continue;
+      const art = String(ab.fields.atat ?? '').split(',').filter(Boolean);
+      art.forEach((p, i) => void this.attachArt(u, p, String(ab.fields[`ata${i}`] ?? ab.fields.ata0 ?? '')));
+    }
+  }
+
+  /** Event objects of animated models: sounds, splats (blood, footprints), ubersplats (craters) and spawned models. */
+  private modelEvent(e: ModelEvent) {
+    for (let o: THREE.Object3D | null = e.root; o; o = o.parent) if (!o.visible) return;
+    const cat = this.assets?.catalog;
+    if (!cat) return;
+    if (e.type === 'SND') this.sound?.playLabel(cat.eventSounds?.[e.id], { x: e.x, y: e.y });
+    else if (e.type === 'SPL') {
+      const def = cat.splats?.[e.id];
+      if (def && this.decals) {
+        this.decals.splat(def, e.x, e.y, e.yaw);
+        if (def.sound) this.sound?.playLabel(def.sound, { x: e.x, y: e.y });
+      }
+    } else if (e.type === 'UBR') {
+      const def = cat.uberSplats?.[e.id];
+      if (def && this.decals) {
+        this.decals.uberSplat(def, e.x, e.y);
+        if (def.sound) this.sound?.playLabel(def.sound, { x: e.x, y: e.y });
+      }
+    } else if (e.type === 'SPN') {
+      const path = cat.spawns?.[e.id];
+      if (path) this.spawnModel(path, e.x, e.y, e.z, e.yaw);
+    }
+  }
+
+  /** A model spawned by an SPN event (blood gush, debris) or an instant attack's impact: plays one sequence once. */
+  /** @param loopFor > 0: the stand sequence loops for this many seconds (e.g. the Skyfury rain cloud). */
+  private spawnModel(path: string, x: number, y: number, z: number, yaw: number, sequence = 'birth', loopFor = 0) {
+    if (!this.assets?.modelExists(path)) return;
+    const start = this.clock;
+    void this.assets.loadModel(path).then((model) => {
+      if (!model) return;
+      const m = cloneSkinned(model);
+      m.position.set(x, y, z);
+      m.rotation.z = yaw;
+      const info = this.assets!.animations(model);
+      const want = loopFor > 0 ? 'stand' : sequence;
+      const seq = info ? (pickSequence(info.sequences, want) ?? pickSequence(info.sequences, 'birth') ?? pickSequence(info.sequences, 'stand') ?? info.sequences[0]) : undefined;
+      let mixer: THREE.AnimationMixer | undefined;
+      let action: THREE.AnimationAction | null = null;
+      if (seq) {
+        mixer = new THREE.AnimationMixer(m);
+        startGlobalClips(mixer, info);
+        action = mixer.clipAction(seq.clip);
+        action.setLoop(loopFor > 0 ? THREE.LoopRepeat : THREE.LoopOnce, Infinity);
+        action.clampWhenFinished = loopFor <= 0;
+        action.play();
+        m.traverse((o) => {
+          if ((o as THREE.Mesh).isMesh && o.name in seq.visibility) o.visible = seq.visibility[o.name];
+        });
+      }
+      this.world.add(m);
+      const frame = () => (seq && action ? { interval: seq.interval, frame: seq.interval[0] + action.time * 1000 } : null);
+      if (info) this.particles.attach(m, model, frame, info.globals);
+      this.matAnim.register(m, frame, model.userData.globals ?? []);
+      const life = loopFor > 0 ? loopFor : Math.min(6, Math.max(0.5, seq?.duration ?? Number(model.userData.lifetime) ?? 1));
+      this.effects.push({ obj: m, start, until: start + life, kind: 'model', mixer, game: true });
+    });
   }
 
   /**
@@ -357,7 +648,7 @@ export class WorldView {
     obj.rotation.order = 'ZYX';
     obj.position.set(m.x, m.y, this.grid.heightAt(m.x, m.y) + m.z);
     this.world.add(obj);
-    const mv: MissileView = { obj, state: { seq: null, action: null }, mixer: null, info: null, last: null, owner: m.source.owner };
+    const mv: MissileView = { obj, phase: 'birth', state: { seq: null, action: null }, mixer: null, info: null, last: null, owner: m.source.owner };
     this.missiles.set(m.id, mv);
     const path = m.model.replace(/\.md[lx]$/i, '');
     if (!this.assets || !path || !this.assets.modelExists(path)) {
@@ -369,24 +660,29 @@ export class WorldView {
       const inst = cloneSkinned(model);
       applyTeamColor(this.assets!, inst, mv.owner);
       obj.add(inst);
+      this.matAnim.register(inst, () => (mv.state.seq && mv.state.action ? { interval: mv.state.seq.interval, frame: mv.state.seq.interval[0] + mv.state.action.time * 1000 } : null), model.userData.globals ?? []);
       const info = this.assets!.animations(model);
       if (!info) return;
       mv.info = info;
       mv.mixer = new THREE.AnimationMixer(inst);
-      this.playMissile(mv, 'stand');
+      // Already hit while the model was loading: the impact is handled by update().
+      if (!this.playMissile(mv, mv.phase === 'birth' ? 'birth' : 'stand')) this.playMissile(mv, 'stand');
       this.particles.attach(inst, model, () => (mv.state.seq && mv.state.action ? { interval: mv.state.seq.interval, frame: mv.state.seq.interval[0] + mv.state.action.time * 1000 } : null), info.globals);
     });
   }
 
-  private playMissile(mv: MissileView, name: 'stand' | 'death') {
+  private playMissile(mv: MissileView, name: 'birth' | 'stand' | 'death') {
+    mv.phase = name;
     if (!mv.mixer || !mv.info) return null;
-    const seq = pickSequence(mv.info.sequences, name) ?? (name === 'stand' ? mv.info.sequences.find((q) => !q.words.includes('death')) : undefined);
+    const seq = pickSequence(mv.info.sequences, name) ?? (name === 'stand' ? mv.info.sequences.find((q) => !q.words.includes('death') && !q.words.includes('birth')) : undefined);
     if (!seq) return null;
     mv.mixer.stopAllAction();
+    startGlobalClips(mv.mixer, mv.info);
     const action = mv.mixer.clipAction(seq.clip);
     action.reset();
-    action.setLoop(name === 'death' ? THREE.LoopOnce : THREE.LoopRepeat, Infinity);
-    action.clampWhenFinished = name === 'death';
+    const once = name !== 'stand';
+    action.setLoop(once ? THREE.LoopOnce : THREE.LoopRepeat, Infinity);
+    action.clampWhenFinished = once;
     action.play();
     mv.state.seq = seq;
     mv.state.action = action;
@@ -448,9 +744,72 @@ export class WorldView {
     this.effects.push({ obj: r, start: this.clock, until: this.clock + 0.8, kind: 'ring' });
   }
 
-  private lightning(from: Unit, to: Unit, color: number) {
-    const a = new THREE.Vector3(from.x, from.y, this.grid.heightAt(from.x, from.y) + Number(from.def.fields.ulpz ?? 150));
-    const b = new THREE.Vector3(to.x, to.y, this.grid.heightAt(to.x, to.y) + to.fly + 40);
+  /**
+   * Instant attack: a lightning bolt like the game's lightning effects (Splats\LightningData.slk, "CHIM" = Lightning
+   * Attack) – a camera-facing textured strip split into segments of AvgSegLen that jitter by NoiseScale × length,
+   * additive, fading out – and the weapon's model plays its death (impact) sequence at the target.
+   */
+  private lightning(from: Unit, to: Unit, color: number, model = '') {
+    const a = new THREE.Vector3(from.x, from.y, this.grid.heightAt(from.x, from.y) + from.fly + Number(from.def.fields.ulpz ?? 150));
+    const b = new THREE.Vector3(to.x, to.y, this.grid.heightAt(to.x, to.y) + to.fly + to.def.impactZ);
+    const path = model.replace(/\.md[lx]$/i, '');
+    if (path) this.spawnModel(path, b.x, b.y, b.z, Math.atan2(b.y - a.y, b.x - a.x), 'death');
+    const def = this.assets?.catalog.lightnings?.CHIM;
+    if (def) {
+      const segs = Math.max(2, Math.round(a.distanceTo(b) / Math.max(10, def.avgSegLen)));
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array((segs + 1) * 6), 3));
+      geo.setAttribute('uv', new THREE.BufferAttribute(new Float32Array((segs + 1) * 4), 2));
+      const idx: number[] = [];
+      for (let i = 0; i < segs; i++) idx.push(i * 2, i * 2 + 1, i * 2 + 3, i * 2, i * 2 + 3, i * 2 + 2);
+      geo.setIndex(idx);
+      const c = def.color.map((v) => v / 255);
+      const mat = new THREE.MeshBasicMaterial({ color: new THREE.Color(c[0], c[1], c[2]), transparent: true, opacity: c[3], blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide, fog: false });
+      void this.assets!.loadTexture(`${def.texture}.blp`).then((t) => {
+        mat.map = t;
+        mat.needsUpdate = true;
+      });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.frustumCulled = false;
+      mesh.renderOrder = 21;
+      this.world.add(mesh);
+      this.bolts.push({ mesh, a, b, segs, def, start: this.gclock, life: 0.45, jitter: [], nextJitter: 0 });
+      return;
+    }
+    this.boltLine(a, b, color);
+  }
+
+  /** Lasting lightning between two units (Mana Drain); an empty id ends the link. */
+  private link(id: number, from: Unit, to: Unit, lightning: string, until: number) {
+    const old = this.bolts.find((b) => b.linkId === id);
+    if (old) old.life = Math.min(old.life, this.gclock - old.start);
+    const def = lightning ? this.assets?.catalog.lightnings?.[lightning] : undefined;
+    if (!def) return;
+    const mesh = this.boltMesh(def, 4);
+    this.bolts.push({ mesh, a: new THREE.Vector3(), b: new THREE.Vector3(), segs: 4, def, start: this.gclock, life: Math.max(0.1, until - this.gclock), jitter: [], nextJitter: 0, linkId: id, follow: { from, to } });
+  }
+
+  private boltMesh(def: NonNullable<AssetCatalog['lightnings']>[string], segs: number) {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array((segs + 1) * 6), 3));
+    geo.setAttribute('uv', new THREE.BufferAttribute(new Float32Array((segs + 1) * 4), 2));
+    const idx: number[] = [];
+    for (let i = 0; i < segs; i++) idx.push(i * 2, i * 2 + 1, i * 2 + 3, i * 2, i * 2 + 3, i * 2 + 2);
+    geo.setIndex(idx);
+    const c = def.color.map((v) => v / 255);
+    const mat = new THREE.MeshBasicMaterial({ color: new THREE.Color(c[0], c[1], c[2]), transparent: true, opacity: c[3], blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide, fog: false });
+    void this.assets!.loadTexture(`${def.texture}.blp`).then((t) => {
+      mat.map = t;
+      mat.needsUpdate = true;
+    });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.frustumCulled = false;
+    mesh.renderOrder = 21;
+    this.world.add(mesh);
+    return mesh;
+  }
+
+  private boltLine(a: THREE.Vector3, b: THREE.Vector3, color: number) {
     const pts: THREE.Vector3[] = [];
     for (let i = 0; i <= 8; i++) {
       const p = a.clone().lerp(b, i / 8);
@@ -460,6 +819,55 @@ export class WorldView {
     const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color, transparent: true }));
     this.world.add(line);
     this.effects.push({ obj: line, start: this.clock, until: this.clock + 0.25, kind: 'line' });
+  }
+
+  private updateBolts(camera: THREE.Camera) {
+    if (!this.bolts.length) return;
+    // View direction in WC3 coordinates – the strip faces the camera.
+    const inv = new THREE.Matrix4().copy(this.world.matrixWorld).invert();
+    const view = new THREE.Vector3(0, 0, -1).transformDirection(camera.matrixWorld).transformDirection(inv);
+    this.bolts = this.bolts.filter((bolt) => {
+      const t = (this.gclock - bolt.start) / bolt.life;
+      if (t >= 1) {
+        this.world.remove(bolt.mesh);
+        bolt.mesh.geometry.dispose();
+        return false;
+      }
+      if (bolt.follow) {
+        const { from, to } = bolt.follow;
+        if (!from.alive || !to.alive) bolt.life = Math.min(bolt.life, this.gclock - bolt.start + 0.05);
+        bolt.a.set(from.x, from.y, this.grid.heightAt(from.x, from.y) + from.fly + (this.units.get(from.uid)?.height ?? 100) * 0.6);
+        bolt.b.set(to.x, to.y, this.grid.heightAt(to.x, to.y) + to.fly + (this.units.get(to.uid)?.height ?? 100) * 0.6);
+      }
+      const { a, b, segs, def } = bolt;
+      const dir = new THREE.Vector3().subVectors(b, a);
+      const len = dir.length();
+      dir.normalize();
+      const side = new THREE.Vector3().crossVectors(dir, view).normalize();
+      const up = new THREE.Vector3().crossVectors(side, dir).normalize();
+      // New jagged shape every few frames, ends stay attached.
+      if (this.gclock >= bolt.nextJitter) {
+        bolt.nextJitter = this.gclock + 0.05;
+        const amp = def.noiseScale * len;
+        bolt.jitter = Array.from({ length: segs + 1 }, (_, i) => (i === 0 || i === segs ? [0, 0] : [(Math.random() * 2 - 1) * amp, (Math.random() * 2 - 1) * amp]));
+      }
+      const pos = bolt.mesh.geometry.getAttribute('position') as THREE.BufferAttribute;
+      const uv = bolt.mesh.geometry.getAttribute('uv') as THREE.BufferAttribute;
+      const half = def.width / 2;
+      const p = new THREE.Vector3();
+      for (let i = 0; i <= segs; i++) {
+        const [j1, j2] = bolt.jitter[i] ?? [0, 0];
+        p.copy(a).lerp(b, i / segs).addScaledVector(side, j1).addScaledVector(up, j2);
+        pos.setXYZ(i * 2, p.x - side.x * half, p.y - side.y * half, p.z - side.z * half);
+        pos.setXYZ(i * 2 + 1, p.x + side.x * half, p.y + side.y * half, p.z + side.z * half);
+        const u = i * def.texCoordScale + (this.gclock - bolt.start) * 2;
+        uv.setXY(i * 2, u, 0);
+        uv.setXY(i * 2 + 1, u, 1);
+      }
+      pos.needsUpdate = uv.needsUpdate = true;
+      (bolt.mesh.material as THREE.MeshBasicMaterial).opacity = (def.color[3] / 255) * (bolt.follow ? Math.min(1, (bolt.life - (this.gclock - bolt.start)) / 0.2) : 1 - t * t);
+      return true;
+    });
   }
 
   floatText(text: string, x: number, y: number, color: string, life: number) {
@@ -473,6 +881,10 @@ export class WorldView {
 
   // --- placement ghost -------------------------------------------------------------------------------
 
+  /**
+   * Placement ghost: the building's own model in its stand pose, translucent, over a grid of footprint cells
+   * (green = buildable, red = blocked or taken by a planned building).
+   */
   showGhost(id: string | null, x = 0, y = 0) {
     if (!id) {
       this.ghost.visible = false;
@@ -480,30 +892,95 @@ export class WorldView {
     }
     if (id !== this.ghostId) {
       if (this.ghostModel) this.ghost.remove(this.ghostModel);
-      const def = this.db.unit(id);
-      const obj = def.attack ? towerPlaceholder(def.attack.attackType, 0x40ff40, 0) : auraTowerPlaceholder();
-      obj.traverse((o) => {
-        const m = o as THREE.Mesh;
-        if (m.isMesh) m.material = mat(0x60ff60, { opacity: 0.45 });
-      });
-      this.ghostModel = obj;
-      this.ghost.add(obj);
+      this.ghostModel = this.ghostOf(id, null, 0.55);
+      this.ghost.add(this.ghostModel);
       this.ghostId = id;
     }
     const [sx, sy] = this.game.grid.snap(x, y, 4);
     this.ghost.visible = true;
     this.ghostModel!.position.set(sx, sy, this.grid.heightAt(sx, sy));
     const cells = this.game.grid.footprintCells(sx, sy, 4);
+    const planned = this.game.plannedSites();
     const m = new THREE.Matrix4();
+    let all = true;
     cells.forEach((c, i) => {
       const [wx, wy] = this.game.grid.center(c.cx, c.cy);
+      const ok = c.ok && !planned.some((p) => Math.abs(p.x - wx) < 64 && Math.abs(p.y - wy) < 64);
+      all &&= ok;
       m.makeTranslation(wx, wy, this.grid.heightAt(wx, wy) + 4);
       this.ghostCells.setMatrixAt(i, m);
-      this.ghostCells.setColorAt(i, new THREE.Color(c.ok ? 0x30ff30 : 0xff3030));
+      this.ghostCells.setColorAt(i, new THREE.Color(ok ? 0x30ff30 : 0xff3030));
     });
     this.ghostCells.instanceMatrix.needsUpdate = true;
     if (this.ghostCells.instanceColor) this.ghostCells.instanceColor.needsUpdate = true;
-    return cells.every((c) => c.ok);
+    return all;
+  }
+
+  /**
+   * Translucent copy of a building in its stand pose (placement ghost, planned building). `tint` multiplies the
+   * model colour like UI\MiscData.txt [Placement] PaidStructureColor. Placeholder shape until the model loads.
+   */
+  private ghostOf(id: string, tint: THREE.Color | null, opacity: number) {
+    const g = new THREE.Group();
+    const def = this.db.unit(id);
+    const ph = def.attack ? towerPlaceholder(def.attack.attackType, 0x40ff40, 0) : auraTowerPlaceholder();
+    ph.traverse((o) => {
+      const mm = o as THREE.Mesh;
+      if (mm.isMesh) mm.material = mat(tint ? tint.getHex() : 0x60ff60, { opacity: opacity * 0.8 });
+    });
+    g.add(ph);
+    if (!this.assets || !def.model || !this.assets.modelExists(def.model)) return g;
+    const tags = String(def.fields.uani ?? '');
+    void this.assets.loadModel(def.model, tags).then((model) => {
+      if (!model) return;
+      const m = cloneSkinned(model);
+      m.scale.setScalar(def.scale);
+      m.traverse((o) => {
+        const mesh = o as THREE.Mesh;
+        if (!mesh.isMesh) return;
+        const mt = (mesh.material as THREE.MeshLambertMaterial).clone();
+        mt.transparent = true;
+        mt.opacity *= opacity;
+        mt.depthWrite = false;
+        if (tint) mt.color.multiply(tint);
+        mesh.material = mt;
+        mesh.renderOrder = 5;
+      });
+      const info = this.assets!.animations(model);
+      const seq = info && pickSequence(info.sequences, 'stand', tags.toLowerCase().split(',').map((s) => s.trim()).filter(Boolean));
+      if (info && seq) {
+        const mixer = new THREE.AnimationMixer(m);
+        startGlobalClips(mixer, info);
+        mixer.clipAction(seq.clip).play();
+        mixer.update(0);
+        m.traverse((o) => {
+          if ((o as THREE.Mesh).isMesh && o.name in seq.visibility) o.visible = seq.visibility[o.name];
+        });
+      }
+      g.clear();
+      g.add(m);
+    });
+    return g;
+  }
+
+  /** Planned buildings (paid, builder still walking): ghosts tinted with PaidStructureColor (96,128,128,255). */
+  private updatePlanned() {
+    const keep = new Set<string>();
+    for (const s of this.game.plannedSites()) {
+      if (s.owner !== this.localPlayer) continue;
+      const key = `${s.id}|${s.x}|${s.y}`;
+      keep.add(key);
+      if (this.planned.has(key)) continue;
+      const g = this.ghostOf(s.id, new THREE.Color(128 / 255, 128 / 255, 1), 96 / 255);
+      g.position.set(s.x, s.y, this.grid.heightAt(s.x, s.y));
+      this.world.add(g);
+      this.planned.set(key, g);
+    }
+    for (const [key, g] of this.planned) {
+      if (keep.has(key)) continue;
+      this.world.remove(g);
+      this.planned.delete(key);
+    }
   }
 
   // --- per frame ---------------------------------------------------------------------------------------
@@ -541,7 +1018,7 @@ export class WorldView {
       } else {
         v.body.position.z = u.flying ? Math.sin(this.clock * 3 + u.uid) * 10 : 0;
       }
-      v.body.scale.setScalar(s * v.baseScale);
+      v.body.scale.setScalar(s * v.baseScale * g.buffScale(u));
       const stealth = u.invisible && u.owner === CREEP_PLAYER;
       if (stealth || opacity < 1) {
         v.body.traverse((o) => {
@@ -556,6 +1033,19 @@ export class WorldView {
       }
       v.selection.visible = this.selection.has(u) && u.alive;
       v.selection.position.z = 4 - u.fly;
+      if (v.circle) {
+        v.circle.visible = v.selection.visible && !u.hidden;
+        v.circle.x = u.x;
+        v.circle.y = u.y;
+      }
+      if (v.shadow) {
+        // ushx / ushy = position of the unit inside the shadow image (from its lower left corner).
+        const f = u.def.fields;
+        v.shadow.x = u.x - (Number(f.ushx) || 0) + v.shadow.halfW;
+        v.shadow.y = u.y - (Number(f.ushy) || 0) + v.shadow.halfH;
+        v.shadow.visible = !u.hidden && opacity > 0.05;
+        v.shadow.color[3] = (this.assets!.catalog.ui!.shadowColor[0] / 255) * opacity * (stealth ? 0.4 : 1);
+      }
       const showHp = u.alive && !u.hidden && (this.showAllHp || !!u.constructing || !!u.upgrading);
       v.hpBg.visible = v.hpFg.visible = showHp;
       if (showHp) {
@@ -574,6 +1064,7 @@ export class WorldView {
       }
     }
     const gdt = g.paused ? 0 : dt * g.speed;
+    this.gclock += gdt;
     for (const [id, mv] of this.missiles) {
       const m = g.missiles.find((x) => x.id === id);
       if (!m) {
@@ -594,6 +1085,7 @@ export class WorldView {
       mv.obj.position.copy(p);
       (mv.last ??= new THREE.Vector3()).copy(p);
       mv.mixer?.update(gdt);
+      if (mv.phase === 'birth' && mv.state.action && !mv.state.action.isRunning()) this.playMissile(mv, 'stand');
     }
     this.effects = this.effects.filter((e) => {
       const t = (this.clock - e.start) / (e.until - e.start);
@@ -613,10 +1105,33 @@ export class WorldView {
     for (const [variable, obj] of this.destructables) {
       const d = g.destructables[variable];
       if (d.id === 'ZTg1') obj.position.z = THREE.MathUtils.lerp(obj.position.z, this.grid.heightAt(d.x, d.y) - (d.open ? 170 : 0), Math.min(1, dt * 4));
-      else if (!d.alive) obj.scale.set(d.scale, d.scale, Math.max(0.15, obj.scale.z - dt * 2));
+      else if (!d.alive) {
+        // Destroyed: the model's death sequence (falling gate), or a squash without one.
+        const p = this.destructableProps.get(variable);
+        if (p && p.current !== 'death') {
+          if (!this.playProp(p, 'death')) p.current = 'death';
+        }
+        if (!p?.seq || !p.seq.words.includes('death')) obj.scale.set(d.scale, d.scale, Math.max(0.15, obj.scale.z - dt * 2));
+      } else if (this.destructableProps.get(variable)?.current === 'death') this.playProp(this.destructableProps.get(variable)!, 'stand');
       else obj.scale.setScalar(d.scale);
     }
+    for (const [uid, b] of this.uberSplats) {
+      if (b.unit.alive && g.units.includes(b.unit)) continue;
+      b.release();
+      this.uberSplats.delete(uid);
+    }
+    this.updatePlanned();
+    this.updateBolts(camera);
+    this.props = this.props.filter((p) => {
+      for (let o: THREE.Object3D | null = p.root; o; o = o.parent) if (o === this.world) {
+        p.mixer.update(gdt);
+        return true;
+      }
+      return !!p.root.parent;
+    });
+    this.matAnim.update(gdt, this.world);
     this.particles.update(gdt, camera);
+    this.decals?.update(gdt);
     this.updateHover(camera, width, height);
     // Float texts (CreateTextTag: velocity 64 upward, fading).
     this.floats = this.floats.filter((f) => {

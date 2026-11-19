@@ -163,7 +163,7 @@ export interface AssetCatalog {
   cliffs: Record<string, { texture: string; modelDir: string; groundTile: string; name: string }>;
   water: { texture: string; numTex: number; texRate: number; height: number; deep: number[][]; shallow: number[][] } | null;
   /** Doodad/destructable id → model path (without extension) and variation count. */
-  doodads: Record<string, { file: string; numVar: number; pathTex?: string; name?: string; category?: string; fixedRotation?: number; texId?: number; texFile?: string }>;
+  doodads: Record<string, { file: string; numVar: number; pathTex?: string; name?: string; category?: string; fixedRotation?: number; texId?: number; texFile?: string; armor?: string }>;
   /** Unit id → merged base data (UnitUI/UnitData/UnitBalance/UnitWeapons) restricted to used fields. */
   units: Record<string, Record<string, string | number>>;
   abilities: Record<string, Record<string, string | number>>;
@@ -172,4 +172,72 @@ export interface AssetCatalog {
   files: string[];
   /** In-game music playlist (SetMapMusic "Music" → race playlist from UI\war3skins.txt). */
   music?: string[];
+  /** Sound labels (UI\SoundInfo\*.slk: AnimSounds, UnitAckSounds, UnitCombatSounds, UISounds) → files and 3D parameters. */
+  sounds?: Record<string, SoundDef>;
+  /** Model event objects "SNDx<id>" → sound label (UI\SoundInfo\AnimLookups.slk). */
+  eventSounds?: Record<string, string>;
+  /** "SPLx<id>" / "FPTx<id>" splats (Splats\SplatData.slk). */
+  splats?: Record<string, SplatDef>;
+  /** "UBRx<id>" ubersplats (Splats\UberSplatData.slk), also used under buildings (unit field "uubs"). */
+  uberSplats?: Record<string, UberSplatDef>;
+  /** Buff / effect art (profile Targetart + Targetattach, Effectart, Specialart) and sounds by buff id. */
+  buffs?: Record<string, { targetArt: string[]; targetAttach: string[]; effectArt: string[]; specialArt: string[]; effectSound?: string; loopSound?: string }>;
+  /** Ability effect sounds and lightning ids by base ability (profile Effectsound / Effectsoundlooped / LightningEffect). */
+  abilityFx?: Record<string, { effectSound?: string; loopSound?: string; lightning?: string[] }>;
+  /** Lightning effects (Splats\LightningData.slk) by id, e.g. CHIM = "Lightning Attack - Chimera". */
+  lightnings?: Record<string, { texture: string; avgSegLen: number; width: number; color: number[]; noiseScale: number; texCoordScale: number; duration: number }>;
+  /** "SPNx<id>" spawned models (Splats\SpawnData.slk) – model path without extension. */
+  spawns?: Record<string, string>;
+  /** UI\war3skins.txt cursor model of the local player's race, UI\MiscData.txt selection circles / shadows. */
+  ui?: {
+    cursor: string;
+    /** Day/night light models (Environment\DNC) for terrain and units. */
+    dnc?: { terrain: string; unit: string };
+    selectionCircles: { maxSize: number; texture: string }[];
+    selectionScale: number;
+    selectionColors: { friend: number[]; neutral: number[]; enemy: number[] };
+    shadowColor: number[];
+  };
+}
+
+export interface SoundDef {
+  files: string[];
+  /** 0–127 */
+  volume: number;
+  pitch: number;
+  pitchVariance: number;
+  minDistance: number;
+  maxDistance: number;
+  distanceCutoff: number;
+  channel: number;
+  flags: string;
+}
+
+export interface SplatDef {
+  texture: string;
+  rows: number;
+  columns: number;
+  /** 0 blend, 1 additive, 2 modulate, 3 modulate 2x, 4 alpha key */
+  blendMode: number;
+  /** Half size of the quad. */
+  scale: number;
+  lifespan: number;
+  decay: number;
+  /** Texture cell intervals [start, end, repeat] for the lifespan and decay phases. */
+  uvLifespan: number[];
+  uvDecay: number[];
+  /** Start / middle / end RGBA (0–255). */
+  colors: number[][];
+  sound?: string;
+}
+
+export interface UberSplatDef {
+  texture: string;
+  blendMode: number;
+  scale: number;
+  birthTime: number;
+  pauseTime: number;
+  decay: number;
+  colors: number[][];
+  sound?: string;
 }

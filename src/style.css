@@ -457,17 +457,88 @@ button.upper:active {
   color: var(--gold);
   font-size: calc(var(--sy) * 0.0095);
 }
-#info .progress {
-  left: calc(var(--sx) * 0.03);
-  right: calc(var(--sx) * 0.03);
+/* Build progress bar (UI\FrameDef\UI\InfoPanelBuildingDetail.fdf BuildTimeIndicator) and the production queue:
+   human-unitqueue-border.blp is 256×128 px = 0.2 × 0.1 UI units, slot positions measured in the texture. */
+#info .build-bar {
+  left: calc(var(--sx) * 0.05);
   top: calc(var(--sy) * 0.04);
-  height: calc(var(--sy) * 0.012);
-  border: 1px solid #8a7a4a;
-  background: #111;
+  width: calc(var(--sx) * 0.1);
+  height: calc(var(--sy) * 0.0125);
 }
-#info .progress > div {
+#info .build-bar.queued {
+  left: calc(var(--sx) * 0.06125);
+  top: calc(var(--sy) * 0.038);
+  width: calc(var(--sx) * 0.12);
+}
+#info .build-bar > div {
+  position: absolute;
+  left: 0;
+  top: 0;
   height: 100%;
-  background: linear-gradient(#e8d070, #9a7a20);
+  background: no-repeat left / 100% 100%;
+}
+#info .build-bar > div {
+  width: 100%;
+}
+#info .progress-label.queued {
+  left: calc(var(--sx) * 0.06125);
+  right: auto;
+  width: calc(var(--sx) * 0.12);
+  top: calc(var(--sy) * 0.025);
+}
+#info .queue-backdrop {
+  left: 0;
+  top: calc(var(--sy) * 0.012);
+  width: calc(var(--sx) * 0.2);
+  height: calc(var(--sy) * 0.1);
+  background: no-repeat 0 0 / 100% 100%;
+  pointer-events: none;
+}
+#info .queue-slot {
+  background: no-repeat center / 100% 100%;
+  cursor: pointer;
+}
+#info .queue-slot.q0 {
+  left: calc(var(--sx) * 0.0086);
+  top: calc(var(--sy) * 0.0272);
+  width: calc(var(--sx) * 0.0367);
+  height: calc(var(--sy) * 0.0352);
+}
+#info .queue-slot.q1 {
+  left: calc(var(--sx) * 0.00860);
+  top: calc(var(--sy) * 0.0703);
+  width: calc(var(--sx) * 0.0234);
+  height: calc(var(--sy) * 0.0234);
+}
+#info .queue-slot.q2 {
+  left: calc(var(--sx) * 0.03985);
+  top: calc(var(--sy) * 0.0703);
+  width: calc(var(--sx) * 0.0234);
+  height: calc(var(--sy) * 0.0234);
+}
+#info .queue-slot.q3 {
+  left: calc(var(--sx) * 0.07110);
+  top: calc(var(--sy) * 0.0703);
+  width: calc(var(--sx) * 0.0234);
+  height: calc(var(--sy) * 0.0234);
+}
+#info .queue-slot.q4 {
+  left: calc(var(--sx) * 0.10235);
+  top: calc(var(--sy) * 0.0703);
+  width: calc(var(--sx) * 0.0234);
+  height: calc(var(--sy) * 0.0234);
+}
+#info .queue-slot.q5 {
+  left: calc(var(--sx) * 0.13360);
+  top: calc(var(--sy) * 0.0703);
+  width: calc(var(--sx) * 0.0234);
+  height: calc(var(--sy) * 0.0234);
+}
+#info .queue-slot.q6 {
+  left: calc(var(--sx) * 0.16485);
+  top: calc(var(--sy) * 0.0703);
+  width: calc(var(--sx) * 0.0234);
+  height: calc(var(--sy) * 0.0234);
 }
 #info .desc {
   left: calc(var(--sx) * 0.008);
@@ -565,6 +636,11 @@ button.upper:active {
   font-size: calc(var(--sy) * 0.009);
   text-shadow: 1px 1px 1px #000, 0 0 2px #000;
 }
+.cmd .cooldown {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
 .cmd .active-hl {
   position: absolute;
   inset: -12%;
@@ -610,6 +686,10 @@ button.upper:active {
 }
 #tooltip .tt-title {
   margin-bottom: calc(var(--sy) * 0.004);
+}
+#tooltip .tt-mana {
+  color: #8cb4ff;
+  margin: 2px 0;
 }
 #tooltip .tt-cost {
   margin-bottom: calc(var(--sy) * 0.004);
@@ -714,7 +794,36 @@ button.upper:active {
   left: 50%;
   top: 40%;
   transform: translate(-50%, -50%);
-  width: calc(var(--sx) * 0.22);
+  width: calc(var(--sx) * 0.26);
+}
+#menu h3 {
+  margin: calc(var(--sy) * 0.008) 0 calc(var(--sy) * 0.003);
+  color: var(--gold);
+  font-weight: normal;
+  font-size: calc(var(--sy) * 0.012);
+}
+#menu label {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--sx) * 0.004);
+  margin: calc(var(--sy) * 0.003) 0;
+  font-size: calc(var(--sy) * 0.011);
+}
+#menu label input[type='range'] {
+  flex: 1;
+  margin-left: auto;
+  accent-color: #c8a040;
+}
+#menu label input[type='checkbox'] {
+  accent-color: #c8a040;
+}
+.wc3-panel button:disabled {
+  color: #807060;
+  filter: none;
+  cursor: default;
+}
+.menu-view[hidden] {
+  display: none;
 }
 #dialog {
   left: 50%;
@@ -752,16 +861,138 @@ button.upper:active {
 #modal p {
   white-space: pre-wrap;
 }
+/* Loading screen (UI\FrameDef\Glue\Loading.fdf): custom panel texts on the right (LoadingTitleText at
+   TOPRIGHT −0.025, −0.295, width 0.36), the map preview like the melee MinimapImage (0.16 × 0.16), bar at the bottom. */
 #loading {
   position: absolute;
   inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 22px;
-  color: var(--gold);
-  background: #000;
+  color: #fff;
+  background: radial-gradient(ellipse at 50% 40%, #1b2030 0%, #07080c 70%, #000 100%);
   z-index: 20;
+  font-size: calc(var(--sy) * 0.013);
+}
+#loading > * {
+  position: absolute;
+}
+#loading-preview {
+  left: calc(var(--sx) * 0.056875);
+  top: calc(var(--sy) * (0.3 - 0.08 - 0.0425));
+  width: calc(var(--sx) * 0.2);
+  height: calc(var(--sy) * 0.2);
+  object-fit: contain;
+  border: 2px solid #6b5a36;
+  box-shadow: 0 0 calc(var(--sy) * 0.02) #000;
+  background: #000;
+}
+#loading-title,
+#loading-subtitle,
+#loading-text {
+  right: calc(var(--sx) * 0.025);
+  width: calc(var(--sx) * 0.4);
+}
+#loading-title {
+  top: calc(var(--sy) * 0.2);
+  text-align: center;
+  font-size: calc(var(--sy) * 0.03);
+  color: rgb(252, 211, 18);
+  text-shadow: 2px 2px 3px #000;
+}
+#loading-subtitle {
+  top: calc(var(--sy) * 0.245);
+  text-align: center;
+  font-size: calc(var(--sy) * 0.018);
+  color: rgb(252, 211, 18);
+}
+#loading-text {
+  top: calc(var(--sy) * 0.285);
+  font-size: calc(var(--sy) * 0.0135);
+  line-height: 1.35;
+  white-space: pre-wrap;
+}
+#loading-label {
+  left: 0;
+  right: 0;
+  bottom: calc(var(--sy) * 0.016 + var(--sx) * 0.05);
+  text-align: center;
+  color: var(--gold);
+  font-size: calc(var(--sy) * 0.014);
+}
+#loading-bar {
+  left: calc(var(--sx) * 0.15);
+  right: calc(var(--sx) * 0.15);
+  bottom: calc(var(--sy) * 0.012);
+  height: calc(var(--sx) * 0.05);
+}
+#loading-bar > div {
+  position: absolute;
+  background-repeat: no-repeat;
+}
+#loading-bar .bg {
+  inset: 12% 1.5%;
+  background: #23263a repeat;
+}
+#loading-bar .fill {
+  left: 1.5%;
+  top: 12%;
+  bottom: 12%;
+  width: 0;
+  background: linear-gradient(#1c2a80, #3db8e8 50%, #1c2a80) repeat-x;
+  background-size: auto 100%;
+  transition: width 0.25s;
+}
+#loading-bar .glow {
+  top: -50%;
+  height: 200%;
+  width: 60%;
+  left: calc(var(--p, 0) * 97% - 59%);
+  background-size: 100% 100%;
+  mix-blend-mode: screen;
+  transition: left 0.25s;
+}
+#loading-bar .glass {
+  inset: 0;
+  background-size: 100% 100%;
+}
+
+/* End of the game: result + score summary. */
+#end-screen {
+  left: 30%;
+  right: 30%;
+  top: calc(var(--sy) * 0.08);
+  z-index: 15;
+  text-align: center;
+  font-size: calc(var(--sy) * 0.013);
+}
+#end-screen h1 {
+  margin: calc(var(--sy) * 0.01) 0;
+  font-weight: normal;
+  font-size: calc(var(--sy) * 0.035);
+  color: var(--gold);
+  text-shadow: 2px 2px 3px #000;
+}
+#end-screen.defeat h1 {
+  color: #ff4040;
+}
+#end-screen table {
+  margin: calc(var(--sy) * 0.012) auto;
+  border-collapse: collapse;
+  min-width: 70%;
+}
+#end-screen td {
+  padding: calc(var(--sy) * 0.003) calc(var(--sx) * 0.008);
+  border-bottom: 1px solid rgba(107, 90, 54, 0.6);
+  text-align: left;
+  color: var(--gold);
+}
+#end-screen td + td {
+  text-align: right;
+  color: #fff;
+}
+#end-screen .end-buttons {
+  display: flex;
+  gap: calc(var(--sx) * 0.01);
+  justify-content: center;
+  margin-bottom: calc(var(--sy) * 0.008);
 }
 #loading[hidden] {
   display: none;
@@ -776,5 +1007,22 @@ button.upper:active {
   z-index: 1;
 }
 #drag-box[hidden] {
+  display: none;
+}
+
+/* Game cursor (UI\Cursor\HumanCursor.mdl) drawn by src/ui/cursor.ts – the system cursor is hidden once it is loaded. */
+html.game-cursor,
+html.game-cursor * {
+  cursor: none !important;
+}
+#game-cursor {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 100000;
+  pointer-events: none;
+  background-repeat: no-repeat;
+}
+#game-cursor[hidden] {
   display: none;
 }

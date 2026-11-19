@@ -15,6 +15,11 @@ export class RtsCamera {
   maxDistance = 3000;
   bounds = { minX: -Infinity, minY: -Infinity, maxX: Infinity, maxY: Infinity };
   scrollSpeed = 2000;
+  /** Options menu: scroll speed factors of the mouse (screen edge) and the arrow keys. */
+  mouseScroll = 1;
+  keyScroll = 1;
+  /** Current edge-scroll direction of the mouse (x right, y up) – the cursor shows scroll arrows. */
+  edge: [number, number] = [0, 0];
   private keys = new Set<string>();
   private mouse = { x: 0, y: 0, inside: false };
   private drag: { x: number; y: number; tx: number; ty: number } | null = null;
@@ -89,17 +94,19 @@ export class RtsCamera {
   update(dt: number, edgeScroll = true) {
     let dx = 0;
     let dy = 0;
-    if (this.keys.has('ArrowLeft')) dx -= 1;
-    if (this.keys.has('ArrowRight')) dx += 1;
-    if (this.keys.has('ArrowUp')) dy += 1;
-    if (this.keys.has('ArrowDown')) dy -= 1;
+    if (this.keys.has('ArrowLeft')) dx -= this.keyScroll;
+    if (this.keys.has('ArrowRight')) dx += this.keyScroll;
+    if (this.keys.has('ArrowUp')) dy += this.keyScroll;
+    if (this.keys.has('ArrowDown')) dy -= this.keyScroll;
+    this.edge = [0, 0];
     if (edgeScroll && this.mouse.inside && !this.drag) {
       const r = this.dom.getBoundingClientRect();
       const m = 6;
-      if (this.mouse.x < m) dx -= 1;
-      if (this.mouse.x > r.width - m) dx += 1;
-      if (this.mouse.y < m) dy += 1;
-      if (this.mouse.y > r.height - m) dy -= 1;
+      const ex = this.mouse.x < m ? -1 : this.mouse.x > r.width - m ? 1 : 0;
+      const ey = this.mouse.y < m ? 1 : this.mouse.y > r.height - m ? -1 : 0;
+      this.edge = [ex, ey];
+      dx += ex * this.mouseScroll;
+      dy += ey * this.mouseScroll;
     }
     if (dx || dy) {
       const s = this.scrollSpeed * dt * (this.distance / 1650);

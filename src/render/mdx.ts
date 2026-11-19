@@ -45,6 +45,16 @@ export class Wc3Assets {
     return this.parsers;
   }
 
+  /** The parsed MDX (mdx-m3-viewer parser object) without conversion – e.g. the 2D cursor model. */
+  async loadRawModel(path: string): Promise<any | null> {
+    const key = `${Wc3Assets.normalize(path.replace(/\.md[lx]$/i, ''))}.mdx`;
+    if (!this.files.has(key)) return null;
+    const { Model } = await this.loadParsers();
+    const model = new Model();
+    model.load(await (await fetch(this.url(key))).arrayBuffer());
+    return model;
+  }
+
   /** Model path without extension, e.g. "units\\orc\\Peon\\Peon". */
   modelExists(path: string) {
     return this.has(`${path.replace(/\.md[lx]$/i, '')}.mdx`);
@@ -135,7 +145,14 @@ export class Wc3Assets {
     const group = new THREE.Group();
     group.name = key;
     const extent = stand?.extent?.max ?? model.extent?.max;
+    const lo = stand?.extent?.min ?? model.extent?.min ?? [0, 0, 0];
+    const hi = extent ?? [0, 0, 0];
+    const cullSphere = new THREE.Sphere(
+      new THREE.Vector3((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2),
+      Math.max(150, Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2])),
+    );
     group.userData.height = extent && extent[2] > 1 ? extent[2] : 0;
+    group.userData.globals = Array.from(globals ?? []);
 
     const texturePromises: Promise<THREE.Texture | null>[] = (model.textures as any[]).map((t) => {
       if (t.replaceableId === 1) return Promise.resolve(teamColorTexture());
@@ -219,11 +236,24 @@ export class Wc3Assets {
         const mat = layerMaterial(layer, tex, Math.max(alpha, 0.01));
         const replaceableId = model.textures[textureId]?.replaceableId ?? 0;
         if (replaceableId) mat.userData.replaceable = replaceableId;
+        // Animated layer: texture flipbook (KMTF, e.g. naga water), UV animation (KTAT/KTAR/KTAS), alpha (KMTA).
+        const anims = (layer.animations as any[]) ?? [];
+        const kmtf = anims.find((a) => a.name === 'KMTF' && a.frames.length > 1);
+        const kmta = anims.find((a) => a.name === 'KMTA' && a.frames.length > 1);
+        const texAnim = layer.textureAnimationId >= 0 ? model.textureAnimations[layer.textureAnimationId] : null;
+        if (kmtf || kmta || texAnim) {
+          layerAnims.set(mat, { layer, textures: kmtf ? textures : null, texAnim, alpha: !!kmta });
+          if (kmta) mat.transparent = true;
+        }
         const mesh = skinned ? new THREE.SkinnedMesh(geo, mat) : new THREE.Mesh(geo, mat);
         mesh.name = `g${gi}_${li}`;
         mesh.renderOrder = (material.priorityPlane ?? 0) * 10 + li;
-        mesh.frustumCulled = !skinned;
-        if (skinned) (mesh as THREE.SkinnedMesh).bind(skeleton!, new THREE.Matrix4());
+        if (skinned) {
+          (mesh as THREE.SkinnedMesh).bind(skeleton!, new THREE.Matrix4());
+          // Frustum culling of animated meshes: a generous sphere around the model's extent instead of the
+          // per-vertex skinned bounds (three.js would otherwise compute them from the bind pose once).
+          (mesh as THREE.SkinnedMesh).boundingSphere = cullSphere.clone();
+        }
         meshes.push({ mesh, geoset: gi, layer });
         group.add(mesh);
       });
@@ -276,22 +306,73 @@ export class Wc3Assets {
       });
     }
     group.userData.emitters2 = emitters2;
+    // Ribbon emitters (arrow / spear trails …) – simulated by ParticleSystem as well.
+    const ribbons: RibbonDef[] = [];
+    for (const r of (model.ribbonEmitters as any[]) ?? []) {
+      if (!(r.objectId >= 0) || !boneIndex.has(r.objectId)) continue;
+      const material = model.materials[r.materialId];
+      const layer = material?.layers?.[0];
+      ribbons.push({
+        node: `n${r.objectId}`,
+        raw: r,
+        texture: layer ? textures[layer.textureId] ?? null : null,
+        filterMode: layer?.filterMode ?? 2,
+        twoSided: !!layer && (layer.flags & 16) !== 0,
+        rows: Math.max(1, r.rows),
+        columns: Math.max(1, r.columns),
+        lifeSpan: Math.max(0.01, r.lifeSpan),
+        emissionRate: r.emissionRate,
+        gravity: r.gravity,
+        priorityPlane: material?.priorityPlane ?? 0,
+      });
+    }
+    group.userData.ribbons = ribbons;
+    // Event objects: SND (sound), SPL / FPT (splat, footprint), UBR (ubersplat), SPN (spawned model).
+    const events: EventDef[] = [];
+    for (const e of (model.eventObjects as any[]) ?? []) {
+      if (!(e.objectId >= 0) || !boneIndex.has(e.objectId)) continue;
+      const type = String(e.name).slice(0, 3).toUpperCase();
+      if (!['SND', 'SPL', 'FPT', 'UBR', 'SPN'].includes(type)) continue;
+      const gs = e.globalSequenceId;
+      events.push({ node: `n${e.objectId}`, type: type === 'FPT' ? 'SPL' : (type as EventDef['type']), id: String(e.name).slice(4, 8).trim(), tracks: Array.from(e.tracks as Uint32Array), globalLength: gs >= 0 && globals[gs] !== undefined ? globals[gs] : -1 });
+    }
+    group.userData.events = events;
+    // Attachment points ("Hand Left Ref", "Chest Ref", "Sprite First Ref" …) for buff / effect art.
+    group.userData.attachments = ((model.attachments as any[]) ?? [])
+      .filter((a) => a.objectId >= 0 && boneIndex.has(a.objectId))
+      .map((a) => ({ words: String(a.name).toLowerCase().replace(/\bref\b/, '').split(/[\s,]+/).filter(Boolean), node: `n${a.objectId}` }));
     const cam = (model.cameras as any[])?.[0];
     if (cam) group.userData.camera = { position: Array.from(cam.position as Float32Array), target: Array.from(cam.targetPosition as Float32Array), fov: cam.fieldOfView, near: cam.nearClippingPlane, far: cam.farClippingPlane };
 
     if (skinned && seqs.length) {
+      // Node tracks on a global sequence loop on their own (e.g. rotating portal planes, waving flags): they are
+      // left out of the sequence clips and collected into one looping clip per global sequence.
+      const isGlobal = (a: any) => a.globalSequenceId >= 0 && globals[a.globalSequenceId] > 0;
+      const globalTracks = new Map<number, THREE.KeyframeTrack[]>();
+      const nodeTracks = (n: any, iv: [number, number], wantGlobal: number | null) => {
+        const out: THREE.KeyframeTrack[] = [];
+        const base = pivot(n.objectId).sub(parentPivot(n));
+        for (const [name, prop] of [['KGTR', 'position'], ['KGRT', 'quaternion'], ['KGSC', 'scale']] as const) {
+          const a = (n.animations as any[]).find((x) => x.name === name);
+          if (!a) continue;
+          if (wantGlobal === null ? isGlobal(a) : !isGlobal(a) || a.globalSequenceId !== wantGlobal) continue;
+          // A global track is sampled over [0, length] like an ordinary sequence.
+          const g = wantGlobal === null ? globals : [];
+          if (prop === 'quaternion') out.push(quatTrack(`n${n.objectId}.quaternion`, a, iv, g));
+          else if (prop === 'position') out.push(vecTrack(`n${n.objectId}.position`, a, iv, g, [0, 0, 0], base));
+          else out.push(vecTrack(`n${n.objectId}.scale`, a, iv, g, [1, 1, 1]));
+        }
+        return out;
+      };
+      globals.forEach((len, gid) => {
+        if (!(len > 0)) return;
+        const tracks = nodes.flatMap((n) => nodeTracks(n, [0, len], gid));
+        if (tracks.length) globalTracks.set(gid, tracks);
+      });
+      const globalClips = [...globalTracks].map(([gid, tracks]) => new THREE.AnimationClip(`global${gid}`, globals[gid] / 1000, tracks));
       const sequences: SequenceInfo[] = seqs.map((s) => {
         const iv: [number, number] = [s.interval[0], s.interval[1]];
-        const tracks: THREE.KeyframeTrack[] = [];
-        for (const n of nodes) {
-          const base = pivot(n.objectId).sub(parentPivot(n));
-          const t = (n.animations as any[]).find((a) => a.name === 'KGTR');
-          const r = (n.animations as any[]).find((a) => a.name === 'KGRT');
-          const sc = (n.animations as any[]).find((a) => a.name === 'KGSC');
-          if (t) tracks.push(vecTrack(`n${n.objectId}.position`, t, iv, globals, [0, 0, 0], base));
-          if (r) tracks.push(quatTrack(`n${n.objectId}.quaternion`, r, iv, globals));
-          if (sc) tracks.push(vecTrack(`n${n.objectId}.scale`, sc, iv, globals, [1, 1, 1]));
-        }
+        const tracks: THREE.KeyframeTrack[] = nodes.flatMap((n) => nodeTracks(n, iv, null));
         const duration = Math.max(0.001, (iv[1] - iv[0]) / 1000);
         const visibility: Record<string, boolean> = {};
         for (const m of meshes) visibility[m.mesh.name] = visibleIn(m, iv);
@@ -307,7 +388,7 @@ export class Wc3Assets {
           visibility,
         };
       });
-      this.anims.set(group, { sequences, globals });
+      this.anims.set(group, { sequences, globals, globalClips });
     }
     return group;
   }
@@ -328,6 +409,13 @@ export interface SequenceInfo {
 export interface ModelAnimations {
   sequences: SequenceInfo[];
   globals: number[];
+  /** Looping clips of node tracks driven by global sequences – play them next to the current sequence. */
+  globalClips: THREE.AnimationClip[];
+}
+
+/** Starts the global-sequence clips of a model instance (after creating its mixer or stopAllAction()). */
+export function startGlobalClips(mixer: THREE.AnimationMixer, info: ModelAnimations | null | undefined) {
+  for (const clip of info?.globalClips ?? []) mixer.clipAction(clip).setLoop(THREE.LoopRepeat, Infinity).play();
 }
 
 /** Particle emitter 2 of a model template (see mdx-m3-viewer's ParticleEmitter2Object for the semantics). */
@@ -353,6 +441,34 @@ export interface Emitter2Def {
   modelSpace: boolean;
   xyQuad: boolean;
   priorityPlane: number;
+}
+
+/** Ribbon emitter of a model template (see mdx-m3-viewer's RibbonEmitterObject). */
+export interface RibbonDef {
+  node: string;
+  /** Parser object – animated tracks KRHA/KRHB (height above/below), KRAL (alpha), KRCO (colour), KRTX (slot), KRVS (visibility). */
+  raw: any;
+  texture: THREE.Texture | null;
+  /** Material layer filter mode (0 none, 1 transparent, 2 blend, 3 additive, 4 add alpha, 5 modulate, 6 modulate 2x). */
+  filterMode: number;
+  twoSided: boolean;
+  rows: number;
+  columns: number;
+  lifeSpan: number;
+  emissionRate: number;
+  gravity: number;
+  priorityPlane: number;
+}
+
+/** Event object (KEVT): fires when the animation passes one of its frames. */
+export interface EventDef {
+  node: string;
+  type: 'SND' | 'SPL' | 'UBR' | 'SPN';
+  /** 4-character id looked up in AnimLookups / SplatData / UberSplatData / SpawnData. */
+  id: string;
+  tracks: number[];
+  /** Length of the global sequence driving the track, -1 = the instance's sequence. */
+  globalLength: number;
 }
 
 /** Portrait camera stored in the model (Cameras chunk), model coordinates. */
@@ -390,6 +506,33 @@ export function evalTrackAt(obj: any, name: string, fallback: number, [start, en
   if (next < 0 || anim.interpolationType === 0) return { value: anim.values[k][0] as number, key: k };
   const t = (f - frames[k]) / Math.max(1, frames[next] - frames[k]);
   return { value: anim.values[k][0] * (1 - t) + anim.values[next][0] * t, key: k };
+}
+
+/** Vector variant of evalTrackAt (e.g. ribbon colour KRCO). */
+export function evalVecTrackAt(obj: any, name: string, fallback: ArrayLike<number>, [start, end]: [number, number], frame: number, globals: number[], globalTime: number): number[] {
+  const anim = (obj.animations as any[] | undefined)?.find((a) => a.name === name);
+  if (!anim || !anim.frames.length) return Array.from(fallback);
+  const gid = anim.globalSequenceId;
+  const global = gid >= 0 && globals[gid] !== undefined;
+  const lo = global ? 0 : start;
+  const hi = global ? globals[gid] : end;
+  const f = global ? (globals[gid] > 0 ? globalTime % globals[gid] : 0) : frame;
+  const frames: number[] = anim.frames;
+  let first = -1;
+  let k = -1;
+  for (let i = 0; i < frames.length; i++) {
+    if (frames[i] < lo || frames[i] > hi) continue;
+    if (first < 0) first = i;
+    if (frames[i] <= f) k = i;
+  }
+  if (first < 0) return Array.from(fallback);
+  if (k < 0) return Array.from(anim.values[first] as ArrayLike<number>);
+  const a = Array.from(anim.values[k] as ArrayLike<number>);
+  const next = k + 1 < frames.length && frames[k + 1] <= hi ? k + 1 : -1;
+  if (next < 0 || anim.interpolationType === 0) return a;
+  const t = (f - frames[k]) / Math.max(1, frames[next] - frames[k]);
+  const b = anim.values[next] as ArrayLike<number>;
+  return a.map((v, i) => v * (1 - t) + b[i] * t);
 }
 
 /** The portrait sequence ("Portrait", not "Portrait Talk") of a portrait or unit model. */
@@ -483,6 +626,93 @@ function quatTrack(name: string, anim: any, iv: [number, number], globals: numbe
   const track = new THREE.QuaternionKeyframeTrack(name, times, values);
   if (anim.interpolationType === 0) track.setInterpolation(THREE.InterpolateDiscrete);
   return track;
+}
+
+interface LayerAnim {
+  layer: any;
+  textures: (THREE.Texture | null)[] | null;
+  texAnim: any;
+  alpha: boolean;
+}
+/** Animated layers of template materials (not in userData: Material.clone() deep-copies userData as JSON). */
+const layerAnims = new WeakMap<THREE.Material, LayerAnim>();
+
+/** Animation state of a model instance: active sequence interval and current frame (ms). */
+export type AnimFrame = () => { interval: [number, number]; frame: number } | null;
+
+const uvMatrix = new THREE.Matrix3();
+
+/**
+ * Animated material layers of model instances like the game: texture flipbooks (KMTF), texture coordinate
+ * animation (KTAT translation, KTAR rotation and KTAS scale around the texture centre, applied in this order as in
+ * mdx-m3-viewer's shader) and layer alpha (KMTA). Each registered instance gets its own copies of the animated
+ * materials (and textures – they share the GPU image); tracks run on the instance's sequence or on global sequences.
+ */
+export class MaterialAnimator {
+  private entries: { root: THREE.Object3D; frame: AnimFrame | null; globals: number[]; mats: { mat: THREE.MeshBasicMaterial; anim: LayerAnim }[] }[] = [];
+  private clockMs = 0;
+
+  register(root: THREE.Object3D, frame: AnimFrame | null, globals: number[]) {
+    const mats: (typeof this.entries)[number]['mats'] = [];
+    const copies = new Map<THREE.Material, THREE.MeshBasicMaterial>();
+    root.traverse((o) => {
+      const mesh = o as THREE.Mesh;
+      const m = mesh.material as THREE.MeshBasicMaterial | undefined;
+      const anim = m ? layerAnims.get(m) : undefined;
+      if (!mesh.isMesh || !anim) return;
+      let copy = copies.get(m!);
+      if (!copy) {
+        copy = m!.clone();
+        if (anim.texAnim && copy.map) {
+          copy.map = copy.map.clone();
+          copy.map.matrixAutoUpdate = false;
+        }
+        copies.set(m!, copy);
+        mats.push({ mat: copy, anim });
+      }
+      mesh.material = copy;
+    });
+    if (mats.length) this.entries.push({ root, frame, globals, mats });
+  }
+
+  update(dt: number, world: THREE.Object3D) {
+    this.clockMs += dt * 1000;
+    this.entries = this.entries.filter((e) => attachedTo(e.root, world));
+    for (const e of this.entries) {
+      const f = e.frame?.() ?? { interval: [0, 0] as [number, number], frame: 0 };
+      for (const { mat, anim } of e.mats) {
+        const at = (obj: any, name: string, fb: number) => evalTrackAt(obj, name, fb, f.interval, f.frame, e.globals, this.clockMs).value;
+        if (anim.textures) {
+          const id = Math.round(at(anim.layer, 'KMTF', anim.layer.textureId));
+          const tex = anim.textures[id];
+          if (tex && mat.map !== tex) {
+            mat.map = tex;
+            mat.needsUpdate = true;
+          }
+        }
+        if (anim.alpha) mat.opacity = Math.max(0, Math.min(1, at(anim.layer, 'KMTA', anim.layer.alpha)));
+        if (anim.texAnim && mat.map) {
+          const ta = anim.texAnim;
+          const t = evalVecTrackAt(ta, 'KTAT', [0, 0, 0], f.interval, f.frame, e.globals, this.clockMs);
+          const q = evalVecTrackAt(ta, 'KTAR', [0, 0, 0, 1], f.interval, f.frame, e.globals, this.clockMs);
+          const s = evalVecTrackAt(ta, 'KTAS', [1, 1, 1], f.interval, f.frame, e.globals, this.clockMs)[0];
+          const angle = 2 * Math.atan2(q[2], q[3]);
+          const c = Math.cos(angle) * s;
+          const sn = Math.sin(angle) * s;
+          // uv' = s·R·(uv + t − ½) + ½
+          const ox = t[0] - 0.5;
+          const oy = t[1] - 0.5;
+          uvMatrix.set(c, -sn, c * ox - sn * oy + 0.5, sn, c, sn * ox + c * oy + 0.5, 0, 0, 1);
+          mat.map.matrix.copy(uvMatrix);
+        }
+      }
+    }
+  }
+}
+
+function attachedTo(o: THREE.Object3D, world: THREE.Object3D) {
+  for (let cur: THREE.Object3D | null = o; cur; cur = cur.parent) if (cur === world) return true;
+  return false;
 }
 
 /** Clones team-coloured materials of a model instance and assigns the player's TeamColor/TeamGlow textures. */

@@ -13,5 +13,11 @@ export default defineConfig({
   build: {
     target: 'es2022',
     chunkSizeWarningLimit: 2000,
+    rollupOptions: {
+      output: {
+        // three.js and the MDX/BLP parsers change rarely – separate chunks cache well and load in parallel.
+        manualChunks: (id: string) => (id.includes('node_modules/three') ? 'three' : id.includes('node_modules/mdx-m3-viewer') ? 'mdx-parsers' : undefined),
+      },
+    },
   },
 });

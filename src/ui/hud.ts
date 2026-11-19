@@ -20,6 +20,10 @@ export interface Command {
   autocast?: boolean;
   /** Small number in the corner (shop stock). */
   count?: number;
+  /** Right click (autocast toggle); without it a right click on an autocast button runs it. */
+  rightClick?: () => void;
+  /** Remaining cooldown 0–1: dark clock sweep over the icon (UI\Feedback\Cooldown\UI-Cooldown-Indicator.mdl). */
+  cooldown?: number;
 }
 
 const $ = (id: string) => document.getElementById(id)!;
@@ -55,7 +59,7 @@ const hpColor = (ratio: number) => (ratio > 0.66 ? '#20ff20' : ratio > 0.33 ? '#
  * its buttons, 3D portrait hole, info panel, 4×3 command card and tooltips.
  */
 export class Hud {
-  mode: { kind: 'normal' } | { kind: 'build'; id: string } | { kind: 'target'; ability: 'coin' | 'attack' | 'move' } = { kind: 'normal' };
+  mode: { kind: 'normal' } | { kind: 'build'; id: string } | { kind: 'target'; ability: 'coin' | 'attack' | 'move' | 'drain' | 'storm'; id?: string } = { kind: 'normal' };
   submenu: 'build' | null = null;
   private commands: Command[] = [];
   private messages: { el: HTMLElement; until: number }[] = [];
@@ -70,6 +74,12 @@ export class Hud {
   private repairAutocast = true;
   private pausedByMenu = false;
   onSelect: (u: Unit | null) => void = () => {};
+  /** The game menu was opened (it starts on its main panel). */
+  onMenuOpen: () => void = () => {};
+  /** Error reported to the player (a sound accompanies the red message in the game). */
+  onError: (err: string) => void = () => {};
+  /** A command button was pressed (interface click sound). */
+  onCommand: () => void = () => {};
   /** All selected units (the first one drives the info panel and command card). */
   group: Unit[] = [];
   onMinimapClick: (x: number, y: number) => void = () => {};
@@ -112,7 +122,7 @@ export class Hud {
     });
     game.on('dialog', (d) => this.showDialog(d));
     game.on('quest', () => this.addMessage(`|cffffcc00Úkoly byly aktualizovány (F9).|r`, 6));
-    game.on('end', (e) => this.showModal(e.victory ? 'Vítězství!' : 'Porážka', `<p>${wc3ToHtml(e.text)}</p><p><button onclick="location.reload()">Hrát znovu</button></p>`));
+    game.on('end', (e) => this.showEnd(e.victory, e.text));
     game.on('completed', (u) => {
       if (u.owner === this.localPlayer) this.addMessage(`|cffffcc00Dokončeno: ${plainText(u.def.name)}|r`, 6, 'sys-messages');
     });
@@ -127,10 +137,6 @@ export class Hud {
       this.showHelp();
     });
     $('btn-pause').addEventListener('click', () => this.togglePause());
-    $('btn-speed').addEventListener('click', () => {
-      game.speed = game.speed >= 4 ? 1 : game.speed * 2;
-      $('btn-speed').textContent = `Rychlost hry: ${game.speed}×`;
-    });
     $('idle-worker').addEventListener('click', () => this.selectBuilder());
     $('mb-min').addEventListener('click', () => $('multiboard').classList.toggle('minimized'));
     for (const id of ['mm-ping', 'mm-terrain', 'mm-ally', 'mm-creep', 'mm-formation']) $(id).addEventListener('mousedown', (e) => e.stopPropagation());
@@ -290,6 +296,7 @@ export class Hud {
     const el = $('menu');
     if (open === !el.hidden) return;
     el.hidden = !open;
+    if (open) this.onMenuOpen();
     if (open && !this.game.paused) {
       this.game.paused = true;
       this.pausedByMenu = true;
@@ -388,6 +395,31 @@ export class Hud {
     el.appendChild(timer);
     this.dialogTimer = { end: this.game.time + d.timeout, el: timer };
     el.hidden = false;
+  }
+
+  /** End of the game (CustomVictoryBJ / CustomDefeatBJ): result and a score summary like the game's score screen. */
+  showEnd(victory: boolean, text: string) {
+    const g = this.game;
+    const p = g.players[this.localPlayer];
+    const t = Math.floor(g.time);
+    const time = `${Math.floor(t / 3600)}:${String(Math.floor(t / 60) % 60).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`;
+    const towers = g.units.filter((u) => u.owner === this.localPlayer && u.kind === 'tower' && u.alive).length;
+    const rows: [string, string | number][] = [
+      ['Dosažená vlna', `${Math.min(g.wave, g.cfg.lastWave)} / ${g.cfg.lastWave}`],
+      ['Zabité jednotky', p.kills],
+      ['Postavené budovy', p.built],
+      ['Věže na konci', towers],
+      ['Získané zlato', p.earned],
+      ['Zlato na konci', p.gold],
+      ['Zbývající životy', g.lives],
+      ['Délka hry', time],
+    ];
+    const el = $('end-screen');
+    el.className = `wc3-panel ${victory ? 'victory' : 'defeat'}`;
+    el.innerHTML = `<h1>${victory ? 'Vítězství!' : 'Porážka!'}</h1><p class="end-text">${wc3ToHtml(text)}</p><table>${rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('')}</table><div class="end-buttons"><button id="end-continue">Pokračovat</button><button id="end-restart">Hrát znovu</button></div>`;
+    el.hidden = false;
+    $('end-continue').addEventListener('click', () => (el.hidden = true));
+    $('end-restart').addEventListener('click', () => location.reload());
   }
 
   showModal(title: string, html: string) {
@@ -507,7 +539,9 @@ modely, textury, rozhraní a zvuky pocházejí z nainstalované hry – viz <cod
 
   private updateInfo(u: Unit | null) {
     const hp = $('portrait-hp');
+    const mp = $('portrait-mp');
     const units = this.group.filter((x) => x.alive);
+    mp.textContent = u && u.alive && u.maxMana > 0 ? `${Math.floor(u.mana)} / ${Math.round(u.maxMana)}` : '';
     if (!u || (!u.alive && u.owner !== CREEP_PLAYER)) {
       hp.textContent = '';
       this.setInfo('', []);
@@ -529,9 +563,21 @@ modely, textury, rozhraní a zvuky pocházejí z nainstalované hry – viz <cod
     if (u.kind === 'creep') parts.push(`<div class="class">Úroveň ${d.level}</div>`);
     const progress = u.constructing ? u.constructing.elapsed / u.constructing.total : u.upgrading ? u.upgrading.elapsed / u.upgrading.total : u.queue[0] ? u.queue[0].elapsed / u.queue[0].total : null;
     if (progress !== null) {
-      const what = u.constructing ? 'Výstavba' : u.upgrading ? `Vylepšování na ${plainText(this.game.db.unit(u.upgrading.to).name)}` : u.queue[0].kind === 'train' ? `Výcvik: ${plainText(this.game.db.unit(u.queue[0].id).name)}` : `Výzkum: ${plainText(this.game.db.upgrade(u.queue[0].id).name(u.queue[0].level))}`;
-      parts.push(`<div class="progress-label">${what}${u.queue.length > 1 ? ` (+${u.queue.length - 1})` : ''}</div><div class="progress"><div style="width:${(progress * 100).toFixed(1)}%"></div></div>`);
-      return this.setInfo(parts.join(''), tips);
+      const db = this.game.db;
+      const what = u.constructing ? 'Výstavba' : u.upgrading ? `Vylepšování na ${plainText(db.unit(u.upgrading.to).name)}` : u.queue[0].kind === 'train' ? `Výcvik: ${plainText(db.unit(u.queue[0].id).name)}` : `Výzkum: ${plainText(db.upgrade(u.queue[0].id).name(u.queue[0].level))}`;
+      // Production queue like the game (UI\war3skins.txt BuildQueueBackdrop): the current item in the big slot with
+      // the progress bar next to it, the rest below; a click on an icon cancels that item.
+      if (u.queue.length && !u.constructing && !u.upgrading) {
+        parts.push(`<div class="queue-backdrop" data-icon="${W}human-unitqueue-border.blp"></div>`);
+        u.queue.slice(0, 7).forEach((q, i) => {
+          const icon = q.kind === 'train' ? db.unit(q.id).icon : db.upgrade(q.id).icon(q.level);
+          const name = q.kind === 'train' ? plainText(db.unit(q.id).name) : plainText(db.upgrade(q.id).name(q.level));
+          tips.push(`<div class="tt-title">${name}</div>Kliknutím zrušíte.`);
+          parts.push(`<div class="queue-slot q${i}" data-queue="${i}" data-tip="${tips.length - 1}" data-icon="${icon}"></div>`);
+        });
+      }
+      parts.push(`<div class="progress-label${u.queue.length && !u.constructing && !u.upgrading ? ' queued' : ''}">${what}</div><div class="build-bar${u.queue.length && !u.constructing && !u.upgrading ? ' queued' : ''}"><div class="fill" data-icon="UI\\Feedback\\BuildProgressBar\\human-buildprogressbar-fill.blp" style="clip-path:inset(0 ${(100 - progress * 100).toFixed(1)}% 0 0)"></div><div class="border" data-icon="UI\\Feedback\\BuildProgressBar\\human-buildprogressbar-border.blp"></div></div>`);
+      return this.setInfo(parts.join(''), tips, u);
     }
     const prefix = `${W}infocard-${u.owner === this.localPlayer ? '' : 'neutral-'}`;
     const stats: { icon: string; label: string; value: string; tip: string }[] = [];
@@ -579,12 +625,28 @@ modely, textury, rozhraní a zvuky pocházejí z nainstalované hry – viz <cod
   }
 
   /** Replaces the info panel content only when it changed (keeps hover tooltips working). */
-  private setInfo(html: string, tips: string[]) {
+  private setInfo(html: string, tips: string[], unit: Unit | null = null) {
     if (html === this.lastInfoKey) return;
+    // Only the progress changed: update the bar in place (keeps hover state and avoids reloading icons).
+    const bar = $('info').querySelector<HTMLElement>('.build-bar .fill');
+    const clip = /clip-path:(inset\([^)]*\))/;
+    const strip = (h: string) => h.replace(clip, '');
+    if (bar && strip(html) === strip(this.lastInfoKey)) {
+      this.lastInfoKey = html;
+      bar.style.clipPath = clip.exec(html)?.[1] ?? bar.style.clipPath;
+      return;
+    }
     this.lastInfoKey = html;
     const el = $('info');
     el.innerHTML = html;
     this.applyIcons(el);
+    el.querySelectorAll<HTMLElement>('[data-queue]').forEach((s) => {
+      s.addEventListener('click', () => {
+        if (!unit || unit.owner !== this.localPlayer) return;
+        this.onCommand();
+        this.game.cancelQueued(unit, Number(s.dataset.queue));
+      });
+    });
     el.querySelectorAll<HTMLElement>('[data-tip]').forEach((s) => {
       const tip = tips[Number(s.dataset.tip)];
       s.addEventListener('mouseenter', () => this.showTooltip(tip));
@@ -641,7 +703,7 @@ modely, textury, rozhraní a zvuky pocházejí z nainstalované hry – viz <cod
     const cmds: Command[] = [];
     if (mobile) {
       cmds.push(this.basic(0, 0, `Přesun (${HK('M')})`, 'M', 'BTNMove.blp', 'Přesune jednotku na zvolené místo.', () => (this.mode = { kind: 'target', ability: 'move' }), { active: moving }));
-      cmds.push(this.basic(2, 0, `Držet pozici (${HK('H')})`, 'H', 'BTNHoldPosition.blp', 'Jednotka zůstane na místě a nebude pronásledovat nepřátele.', stop));
+      cmds.push(this.basic(2, 0, `Držet pozici (${HK('H')})`, 'H', 'BTNHoldPosition.blp', 'Jednotka zůstane na místě a nebude pronásledovat nepřátele.', () => this.sameType(u).forEach((x) => g.hold(x)), { active: u.holdPosition }));
       cmds.push(this.basic(0, 1, `Hlídka (${HK('P')})`, 'P', 'BTNPatrol.blp', 'Jednotka bude hlídkovat mezi současnou pozicí a cílovým místem.', () => (this.mode = { kind: 'target', ability: 'move' })));
     }
     cmds.push(this.basic(1, 0, `Stát (${HK('S')})`, 'S', 'BTNStop.blp', 'Zastaví jednotku a zruší její rozkazy.', stop));
@@ -695,7 +757,7 @@ modely, textury, rozhraní a zvuky pocházejí z nainstalované hry – viz <cod
         }
         if (id === g.cfg.coinBasherAbility) {
           const cd = Math.max(0, (u.abilityCd[id] ?? 0) - g.time);
-          cmds.push({ x: Number(ab.fields.abpx ?? 3), y: Number(ab.fields.abpy ?? 0) === 0 ? 2 : Number(ab.fields.abpy), label: cd ? `${ab.name} (${cd.toFixed(0)})` : ab.name, icon: ab.icon, hotkey: hotkeyOf({ hotkey: String(ab.fields.ahky ?? ''), tooltip: ab.tooltip }), enabled: cd === 0, cost: g.wave, count: cd ? Math.ceil(cd) : undefined, tooltip: () => `<div class="tt-title">${wc3ToHtml(ab.tooltip)}</div>${this.costLine(g.wave)}${wc3ToHtml(ab.description)}`, run: () => (this.mode = { kind: 'target', ability: 'coin' }) });
+          cmds.push({ x: Number(ab.fields.abpx ?? 3), y: Number(ab.fields.abpy ?? 0) === 0 ? 2 : Number(ab.fields.abpy), label: ab.name, icon: ab.icon, hotkey: hotkeyOf({ hotkey: String(ab.fields.ahky ?? ''), tooltip: ab.tooltip }), enabled: cd === 0, cost: g.wave, cooldown: cd > 0 ? cd / Math.max(0.01, Number(ab.fields['acdn@1'] ?? 8)) : undefined, tooltip: () => `<div class="tt-title">${wc3ToHtml(ab.tooltip)}</div>${this.costLine(g.wave)}${wc3ToHtml(ab.description)}`, run: () => (this.mode = { kind: 'target', ability: 'coin' }) });
         }
       }
       return cmds;
@@ -743,8 +805,50 @@ modely, textury, rozhraní a zvuky pocházejí z nainstalované hry – viz <cod
       return cmds;
     }
 
-    if (u.kind === 'defender') cmds.push(...this.orderButtons(u, true));
+    if (u.kind === 'defender') {
+      cmds.push(...this.orderButtons(u, true));
+      cmds.push(...this.spellButtons(u));
+    }
     return cmds;
+  }
+
+  /**
+   * Active spells of the temple defenders: Share Mana (Arpm, autocast – right click toggles), Mana Drain (AHdr,
+   * target a creep), Bless Weapons (ACro, instant) and Skyfury (ACmo, target an area). Mana cost and cooldown as in the game.
+   */
+  private spellButtons(u: Unit): Command[] {
+    const g = this.game;
+    const out: Command[] = [];
+    for (const id of u.def.abilities) {
+      const ab = g.db.ability(id);
+      if (!['Arpm', 'AHdr', 'ACro', 'ACmo'].includes(ab.base)) continue;
+      const f = ab.fields;
+      const cd = Math.max(0, (u.abilityCd[id] ?? 0) - g.time);
+      const cost = Number(f['amcs@1'] ?? 0);
+      const total = Math.max(0.01, Number(f['acdn@1'] ?? 1));
+      const mana = cost ? `<div class="tt-mana">${cost} many</div>` : '';
+      const report = (err: string | null) => this.report(err);
+      const run = () => {
+        if (ab.base === 'Arpm') report(g.castShareMana(u, id));
+        else if (ab.base === 'ACro') report(g.castRoar(u, id));
+        else this.mode = { kind: 'target', ability: ab.base === 'AHdr' ? 'drain' : 'storm', id };
+      };
+      const auto = ab.base === 'Arpm' ? u.autocast[id] !== false : undefined;
+      out.push({
+        x: Number(f.abpx ?? 0),
+        y: Number(f.abpy ?? 2),
+        label: ab.name,
+        icon: ab.base === 'Arpm' && auto === false ? String(f.auar ?? ab.icon) : ab.icon,
+        hotkey: hotkeyOf({ hotkey: String(f.ahky ?? ''), tooltip: ab.tooltip }),
+        enabled: cd === 0 && u.mana >= cost,
+        cooldown: cd > 0 ? cd / total : undefined,
+        autocast: auto,
+        tooltip: () => `<div class="tt-title">${wc3ToHtml(ab.tooltip)}</div>${mana}${wc3ToHtml(ab.description)}${auto !== undefined ? '<br><span style="color:#ffcc00">Automatické sesílání zapnete / vypnete pravým tlačítkem.</span>' : ''}`,
+        run,
+        rightClick: auto !== undefined ? () => g.setAutocast(u, id, !auto) : undefined,
+      });
+    }
+    return out;
   }
 
   private shopCommands(shop: Unit): Command[] {
@@ -768,7 +872,9 @@ modely, textury, rozhraní a zvuky pocházejí z nainstalované hry – viz <cod
   }
 
   report(err: string | null) {
-    if (err) this.addMessage(`|cffff4040${err}|r`, 3);
+    if (!err) return;
+    this.addMessage(`|cffff4040${err}|r`, 3);
+    this.onError(err);
   }
 
   private updateCard(u: Unit | null) {
@@ -789,7 +895,13 @@ modely, textury, rozhraní a zvuky pocházejí z nainstalované hry – viz <cod
       }
       used.add(key);
     }
-    const cardKey = this.commands.map((c) => `${c.x}${c.y}${c.label}${c.enabled}${c.cost}${c.active}${c.autocast}${c.count}`).join('|') + (u?.uid ?? '');
+    const cardKey = this.commands.map((c) => `${c.x}${c.y}${c.label}${c.enabled}${c.cost}${c.active}${c.autocast}${c.count}${c.cooldown !== undefined}`).join('|') + (u?.uid ?? '');
+    // The cooldown sweep changes every frame – updated in place without rebuilding the card.
+    for (const c of this.commands) {
+      if (c.cooldown === undefined) continue;
+      const el = $('card').querySelector<HTMLElement>(`[data-slot="${c.x},${c.y}"] .cooldown`);
+      if (el) el.style.background = cooldownSweep(c.cooldown);
+    }
     if (cardKey === this.lastCardKey) return;
     this.lastCardKey = cardKey;
     const card = $('card');
@@ -798,13 +910,18 @@ modely, textury, rozhraní a zvuky pocházejí z nainstalované hry – viz <cod
       for (let x = 0; x < 4; x++) {
         const c = this.commands.find((k) => k.x === x && k.y === y);
         const el = document.createElement('div');
-        el.className = 'cmd' + (c ? (c.enabled ? '' : ' disabled') + (c.autocast ? ' autocast' : '') : ' empty');
+        el.className = 'cmd' + (c ? (c.enabled || c.cooldown !== undefined ? '' : ' disabled') + (c.autocast ? ' autocast' : '') : ' empty');
         if (c) {
-          el.innerHTML = `<span class="lbl">${c.label}</span>${c.active ? `<div class="active-hl" data-icon="${W}CommandButton\\human-activebutton.blp"></div>` : ''}${c.count !== undefined ? `<span class="count">${c.count}</span>` : ''}`;
-          el.addEventListener('click', () => c.run());
+          el.dataset.slot = `${x},${y}`;
+          el.innerHTML = `<span class="lbl">${c.label}</span>${c.active ? `<div class="active-hl" data-icon="${W}CommandButton\\human-activebutton.blp"></div>` : ''}${c.count !== undefined ? `<span class="count">${c.count}</span>` : ''}${c.cooldown !== undefined ? `<div class="cooldown" style="background:${cooldownSweep(c.cooldown)}"></div>` : ''}`;
+          el.addEventListener('click', () => {
+            this.onCommand();
+            c.run();
+          });
           el.addEventListener('contextmenu', (e) => {
             e.preventDefault();
-            if (c.autocast !== undefined) c.run();
+            if (c.rightClick) c.rightClick();
+            else if (c.autocast !== undefined) c.run();
           });
           if (c.icon) void this.iconUrl(c.icon).then((url) => url && ((el.style.backgroundImage = `url(${url})`), el.classList.add('has-icon')));
           el.addEventListener('mouseenter', () => this.showTooltip(c.tooltip()));
@@ -865,7 +982,14 @@ modely, textury, rozhraní a zvuky pocházejí z nainstalované hry – viz <cod
     const c = k && this.commands.find((x) => x.hotkey === k);
     if (c) {
       e.preventDefault();
+      this.onCommand();
       c.run();
     }
   }
+}
+
+/** Cooldown clock: the remaining part as a dark sector that shrinks clockwise from 12 o'clock like the game. */
+function cooldownSweep(remaining: number) {
+  const done = (1 - Math.max(0, Math.min(1, remaining))) * 360;
+  return `conic-gradient(transparent 0deg ${done.toFixed(1)}deg, rgba(0, 0, 0, 0.62) ${done.toFixed(1)}deg 360deg)`;
 }

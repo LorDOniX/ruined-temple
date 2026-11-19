@@ -27,12 +27,17 @@ npm run assets -- --game "Warcraft III - Gold Edition" --dir "Classic HD for Cla
 npm run dev          # http://127.0.0.1:5199
 npm run build        # produkční build do dist/
 npm run report       # přehled vytěžených dat → docs/DATA.md
+npm test             # headless testy simulace (vitest, tests/simulation.test.ts)
 ```
 
-Ovládání: levé tlačítko výběr / potvrzení stavby, tažením výběr více jednotek (Shift přidává), pravé pohyb / vynucený cíl věže, šipky + okraj obrazovky + prostřední
+Ovládání: levé tlačítko výběr / potvrzení stavby (Shift = další stavba do fronty dělníka), tažením výběr více jednotek (Shift přidává), dvojklik / Ctrl+klik = všechny
+jednotky stejného typu na obrazovce, pravé pohyb / vynucený cíl věže / pokračování rozestavěné věže dělníkem, `Ctrl+0–9` uloží skupinu, `Shift+0–9` přidá, `0–9` vybere
+(dvakrát rychle = kamera na skupinu; fyzické klávesy, takže funguje i česká řada `+ěščř…`), šipky + okraj obrazovky + prostřední
 tlačítko posun kamery, kolečko zoom, hotkeye jako ve hře (zvýrazněné písmeno v tooltipu), `Tab` / tlačítko nečinného dělníka = builder,
-`Alt` ukazatele zdraví, `Esc` zpět, `F9` úkoly, `F10` nabídka (pauza, rychlost 1×/2×/4×, hudba, regiony, pathing, nápověda – v singleplayeru pauzuje hru),
-`F11` spojenci, `F2` regiony + trasa creepů, `F3` pathing mapa. Tlačítka Chat, minimapy, Hold/Patrol/Repair jsou jen vizuální (Patrol = pohyb).
+`Alt` ukazatele zdraví, `Esc` zpět, `F9` úkoly, `F10` nabídka jako ve hře (pauza, Možnosti: rychlost hry, rychlost posunu myší a klávesnicí, zvuk a hudba
+s hlasitostí – ukládá se do `localStorage`, ladění regionů a pathingu; Ukončit hru: restart / vzdát; v singleplayeru pauzuje hru),
+`F11` spojenci, `F2` regiony + trasa creepů, `F3` pathing mapa. Obránci: Držet pozici (H) vypne pronásledování, kouzla na tlačítkách (Share Mana – autocast
+pravým tlačítkem, Mana Drain a Skyfury s cílem, Bless Weapons). Klik na ikonu ve frontě výroby ji zruší. Tlačítka Chat, minimapy, Patrol/Repair jsou jen vizuální (Patrol = pohyb).
 V konzoli prohlížeče jsou k dispozici objekty `game`, `view`, `cam`, `db`, `map`, `hud`, `portrait` a `frame(dt)`.
 
 ## 3. Architektura
@@ -55,13 +60,17 @@ V konzoli prohlížeče jsou k dispozici objekty `game`, `view`, `cam`, `db`, `m
    ├─ render/textures.ts procedurální textury ve stejném layoutu jako originální tileset BLP
    ├─ render/world.ts   synchronizace stavu hry se scénou (jednotky, doodady, projektily, efekty, HP bary, hover štítek, ghost stavby)
    ├─ render/mdx.ts     loader originálních MDX/BLP → three.js (skeletální animace, emitory částic, kamera portrétu)
-   ├─ render/particles.ts ParticleEmitter2 – simulace na CPU, dávkové billboardy podle textury a blend módu
+   ├─ render/particles.ts ParticleEmitter2 + ribbony – simulace na CPU, dávkové billboardy podle textury a blend módu; event objekty modelů (SND/SPL/UBR/SPN)
+   ├─ render/decals.ts  textury na terénu: splaty (krev, stopy), ubersplaty (krátery, dlaždice pod budovami), stíny, výběrové kruhy
    ├─ render/portrait.ts 3D portrét (`*_portrait.mdx`, sekvence „Portrait“, kamera z modelu) do otvoru konzole
    ├─ render/placeholders.ts zástupné tvary
    ├─ render/camera.ts  WC3 kamera (AoA 304°, vzdálenost 1650, FOV 70°, hranice z w3i)
+   ├─ render/daynight.ts den/noc z Environment\DNC\DNCLordaeron (barvy světla podle denní doby)
+   ├─ ui/cursor.ts      kurzor hry z UI\Cursor\HumanCursor.mdl (sprite sheet + animace textury KTAT)
+   ├─ ui/menu.ts        herní menu F10 (hlavní panel, Možnosti, Ukončit hru)
    ├─ ui/hud.ts         Human konzole (textury + FDF souřadnice), command card, info panel, multiboard, minimapa, dialogy
    ├─ style.css         rozložení konzole v UI jednotkách obrazovky 0,8 × 0,6 (`--sx`, `--sy` = px na jednotku)
-   └─ sound.ts          přehrávání originálních zvuků (pokud jsou dodány)
+   └─ sound.ts          originální zvuky: soubory mapy + labely z UI\SoundInfo\*.slk (útlum podle vzdálenosti, panorama, limity)
 ```
 
 Souřadnice: vše uvnitř `WorldView.world` je ve světových jednotkách WC3 (X východ, Y sever, Z nahoru);
@@ -108,20 +117,31 @@ Podrobný přehled vln, věží, výzkumů a schopností: [DATA.md](./DATA.md).
 | Rozložení mapy, výšky, regiony, trasa, pathing | ✅ z dat |
 | Blending textur terénu | ✅ algoritmus hry + HD textury Ruins z modu |
 | Útesy | ✅ originální modely (Cliffs / CityCliffs) zvednuté o výšku terénu jako ve hře; rampy zatím jako svah |
-| Doodady / jednotky / budovy | ✅ originální MDX (varianta podle `uani`, team color, replaceable textury, animovaná ID textur); doodady staticky v pose „stand“ |
+| Doodady / jednotky / budovy | ✅ originální MDX (varianta podle `uani`, team color, replaceable textury); statické doodady instancované, animované (ohniště, hrnce, totemy, mouchy, trosky) jako samostatné kopie s vlastní animací a náhodnou fází; destructables (portál, mříže, brána) animované, brána při zničení hraje „death“ |
+| Animace materiálů | ✅ flipbook textur KMTF (voda ve Spawning Grounds / Hightower, 45 snímků), animace UV KTAT/KTAR/KTAS (střely), alfa vrstvy KMTA; stopy kostí na globálních sekvencích běží jako samostatné smyčky (portál, vlajky) |
+| Osvětlení | ✅ den/noc podle `DNCLordaeron{Terrain,Unit}.mdl` (barvy ambientu a difúzního světla, BGR) relativně k poledni, stejné hodiny jako konzole (den = 8 min, start 8:00); mapa má mlhu vypnutou, obloha při kameře hry není vidět |
 | Ikony | ✅ HD ikony z modu v command card, info panelu (`infocard-*`, cizí jednotky `infocard-neutral-*`), multiboardu a tlačítkách minimapy |
 | Rozhraní (konzole) | ✅ podle videa: `HumanUITile01–04` rozložené dle `ConsoleUI.fdf` (horní pruh v 0–0,125, spodní v 0,3125–1), kryt inventáře se znakem, hodiny dne/noci (`HumanUITile-TimeIndicator*`, den = 8 min), tlačítka `human-console-buttonstates2`, zdroje dle `ResourceBar.fdf` („Žádná údržba“), multiboard dle `MultiBoard.fdf` (šířky sloupců a ikony z triggeru), okraje z edge souborů (`editbox-border`, `human-tooltip-border`, `human-options-menu-border`), font `FRIZQT__.TTF`, české popisky jako v CZ klientu (Útok, Zbroj, Nezranitelný, Úroveň, Stav, Dokončeno: …) |
 | Náhled jednotek | ✅ 3D portrét s HP (barva podle zdraví; u nezranitelných budov skryto), info panel: jméno, „Úroveň N“ u creepů, útok (skrytý u zbraní jen na „debris“ – vlnoví creepové), zbroj, stav; tooltipy statistik; při výběru více jednotek mřížka ikon s HP; štítek „Creeps“ s HP barem nad jednotkou pod kurzorem; HP bary nad jednotkami jen s `Alt` jako ve hře |
 | Potvrzení příkazů | ✅ `Confirmation.mdl` (3 šipky sbíhající se do bodu, zeleně) při pohybu, `Target.mdl` (červeně) při útoku na jednotku – dle `TargetPointConfirm` / `TargetUnitConfirm` v `UI\war3skins.txt`, barvy ověřeny podle videa |
 | Animace jednotek | ✅ skeletální animace MDX (kosti z uzlů modelu, matrix groups → skinning, klipy pro každou sekvenci): stand / walk (rychlost dle pohybu) / attack / death / birth (při stavbě natažená na dobu stavby); výběr sekvence podle značek jako ve hře („Stand Upgrade First Ready Attack“), viditelnost geosetů per sekvence |
 | Projektily | ✅ originální model zbraně (`ua1m`): sekvence „stand“ za letu natočená po dráze, při dopadu „death“ (výbuch) na místě; vystřelení v bodě poškození útoku (`udp1`, u věží 0,3 s), odpaliště `ulpx/ulpy/ulpz`, výška zásahu `uimz`, rychlost `ua1z`, oblouk `uma1` |
-| Částicové efekty | ✅ ParticleEmitter2 (jednotky, projektily – kouř dělových koulí, výbuchy, oheň, mráz…): rychlost, rozptyl, gravitace, šířka/délka, segmenty barvy/alfy/měřítka, head/tail, buňky textury, squirt, animované KP2V/KP2E/KP2S…; ❌ ribbony (stopy šípů), ParticleEmitter (typ 1), animace doodadů |
+| Částicové efekty | ✅ ParticleEmitter2 (jednotky, projektily – kouř dělových koulí, výbuchy, oheň, mráz…): rychlost, rozptyl, gravitace, šířka/délka, segmenty barvy/alfy/měřítka, head/tail, buňky textury, squirt, animované KP2V/KP2E/KP2S…; ✅ ribbony (stopy šípů a kopí: KRHA/KRHB/KRAL/KRCO/KRVS, doba života segmentů, filtr vrstvy materiálu); ❌ ParticleEmitter (typ 1), animace doodadů |
+| Event objekty modelů | ✅ jako ve hře / mdx-m3-viewer: událost se spustí, když animace přejde klíčový snímek (KEVT). `SND` → `AnimLookups.slk` → `AnimSounds.slk` (výstřel v sekvenci „Birth“ střely, zásah v „Death“, výkřik při smrti, údery kladiva v „Stand Work“), `SPL`/`FPT` → `SplatData.slk` (krev zůstává 2 min, stopy 7 s), `UBR` → `UberSplatData.slk` (krátery minometu, spálenina zničené budovy), `SPN` → `SpawnData.slk` (gejzír krve) |
+| Stíny, výběr, podklady budov | ✅ blob stín `ushu` (umístění `ushx/ushy/ushw/ushh`, barva `ShadowImageColor`), výběrový kruh `SelectionCircleSmall/Med/Large` podle `ussc × 72` (`UI\MiscData.txt`, barvy spojenec/nepřítel/neutrál), ubersplat `uubs` pod budovou (náběh při stavbě, odeznění po zbourání) – vše jako textury kopírující terén |
+| Kurzor | ✅ `UI\Cursor\HumanCursor.mdl`: Normal, Select (animace při najetí na jednotku), Target / TargetSelect (rotující zaměřovač tónovaný červeně / zeleně / žlutě podle cíle), šipky posunu na okraji obrazovky; velikost a hotspot z modelu |
 | Herní logika triggerů | ✅ |
+| Stavba | ✅ Human: dělník dojde, založí, pracuje (Stand Work), bez něj stavba stojí; ghost = originální model věže nad buňkami (zelená / červená), naplánované stavby ve frontě dělníka namodrale (`PaidStructureColor`) |
+| Fronta výroby, cooldowny | ✅ `human-unitqueue-border` (velký slot + 6 malých), progress bar z `BuildProgressBar` textur; cooldown jako tmavá výseč (conic-gradient) |
+| Nahrávací a koncová obrazovka | ✅ náhled mapy, název / hráči / popis z `w3i` (rozložení `Loading.fdf`), loading bar z `Loading-Bar*` textur; vítězství / porážka se souhrnem skóre |
+| Blesky | ✅ okamžité útoky bleskových věží: textura `CHIM` z `LightningData.slk` (segmenty, šum, posun textury, dohasínání) + „death“ modelu střely v cíli; Mana Drain jako trvalý blesk `DRAM` mezi jednotkami |
 | Statistiky věží a creepů | ✅ z mapy + nezměněná pole z originálních SLK tabulek 1.26a |
 | Schopnosti věží | ✅ jed/zpomalení (Aspo), odrazy (`mbounce`: `utc1`/`udl1`/`ua1f`), multishot (Aroc), bash/zmrazení (ACbh), auro útočné rychlosti a poškození (AOae/ACac), detekce neviditelných (Adts + výzkum R001), Searing Arrows bonus |
-| Schopnosti creepů | ✅ neviditelnost (Apiv), imunita na magii (Amim), úhyb (ACev), Phase Shift (Apsh); ❌ Bloodlust (AI sesílání), Resistant Skin, Asp3 |
-| Obránci chrámu | ✅ trénink, výzkum zbraní, útok; ❌ jejich aktivní kouzla (Share Mana, Mana Drain, Bless Weapons, Skyfury) |
-| Zvuky a hudba | ✅ všech 33 zvuků mapy; hudba dle `SetMapMusic("Music")` = Human playlist z `UI\war3skins.txt` (4 skladby, náhodně) |
+| Schopnosti creepů | ✅ neviditelnost (Apiv), imunita na magii (Amim), úhyb (ACev), Phase Shift (Apsh), Bloodlust (Shamani autocastem na creepy v boji: +25 % pohyb, +40 % útok, +30 % velikost, ohně na rukou), Resistant Skin (negativní kouzla trvají hrdinskou dobu `ahdu`), Asp3 (obíhající koule na bodech „sprite“) |
+| Obránci chrámu | ✅ trénink, výzkum zbraní, útok, mana (`umpi/umpm/umpr`, údaj pod portrétem), pronásledování cílů v dosahu získání (`uacq`, vypne Držet pozici), kouzla: Share Mana (Arpm, autocast), Mana Drain (AHdr), Bless Weapons (ACro → buff B002 +50 % poškození), Skyfury (ACmo → údery každé 2 s v okruhu 250) |
+| Buffy | ✅ obecný systém buffů s grafikou na připojovacích bodech modelu (`Targetart` + `Targetattach` z profilu hry nebo `ftat`/`fta0` mapy): Bloodlust, Blessed Weapons, odsávání many, jed |
+| Lokalizace | ✅ systémové hlášky ve znění CZ klienta (`Units\CommandStrings.txt`: Nedostatek zlata., Zde nelze stavět., Cíl je mimo dostřel., Kouzlo zatím není připraveno., Nedostatek many., …); texty mapy anglicky jako v originále |
+| Zvuky a hudba | ✅ všech 33 zvuků mapy; hudba dle `SetMapMusic("Music")` = Human playlist z `UI\war3skins.txt` (4 skladby, náhodně); zvuky event objektů modelů (výstřely, zásahy, smrt); odpovědi jednotek z `UnitAckSounds.slk` podle `usnd` (What při výběru – po opakovaném klikání Pissed –, Yes / YesAttack při příkazu, Ready po výcviku; vždy jen jedna naráz); zásah creepa do brány `UnitCombatSounds.slk` (`ucs1` × brnění brány); rozhraní z `UISounds.slk` (klik, chyba, „Not enough gold“, „Can't build there“, umístění stavby, Job's done, Upgrade / Research complete); 3D zvuky slábnou od středu pohledu (MinDistance → DistanceCutoff) a mají stereo panorama |
 | Multiplayer (1–3 hráči co-op) | ❌ jen 1 hráč lokálně (logika počítá s počtem hráčů – lze rozšířit) |
 
 ## 6. Co z dat mapy získat nejde – odkud se to bere
@@ -132,6 +152,12 @@ Podrobný přehled vln, věží, výzkumů a schopností: [DATA.md](./DATA.md).
 |---|---|
 | `Warcraft III - Gold Edition` (patch 1.26a, `war3.mpq`, `War3x.mpq`, `War3xLocal.mpq`, `War3Patch.mpq`) | 436 MDX modelů (jednotky, budovy, doodady, útesy, projektily), SLK/TXT tabulky, 33 WAV zvuků, 4 MP3 skladby, team color |
 | `Classic HD for Classic` (mod z Nexusu, jen DDS textury) | HD textury terénu Ruins, útesů (`_tilesets\z.w3mod`), ikony, textury jednotek a doodadů |
+
+Kromě souborů, které jmenují data mapy, nástroj prochází **event objekty každého kopírovaného modelu** a podle
+`UI\SoundInfo\AnimLookups.slk` / `AnimSounds.slk`, `Splats\SplatData.slk`, `UberSplatData.slk` a `SpawnData.slk` přidá do
+`catalog.json` jejich zvuky, splaty, ubersplaty a spawn modely (ty se pak zpracují rekurzivně). Dále odpovědi jednotek
+(`UnitAckSounds.slk` podle `usnd`), zvuky zásahů (`UnitCombatSounds.slk`), zvuky rozhraní (`UISounds.slk`), stíny (`ushu`),
+výběrové kruhy (`UI\MiscData.txt`) a kurzor rasy (`UI\war3skins.txt`).
 
 `npm run assets -- --game <složka hry> --dir <mod>` čte MPQ přes **StormLib (WebAssembly)** – vestavěný parser
 mdx-m3-viewer nezvládal `war3.mpq` a WAVy s kompresí huffman. Pozdější zdroj má přednost, takže HD textura z modu
@@ -162,23 +188,27 @@ Zjištění z tabulek, která mění hratelnost:
 - **Tabulka poškození**: verze 1.21+ (shodná s 1.26a) – Divine brnění bere 5 %.
 - **Dosah aur** se měří k okraji cíle (+72), aby „must be touching“ aura zasáhla 8 sousedů.
 - **Obchod Hightower**: nákup bez požadavku na blízkost jednotky (ve hře `Ane2` vyžaduje jednotku poblíž).
-- **Stavba**: budova se staví sama, builder k ní jen dojde (u Human builderu ve hře stavba čeká na buildera).
-- Obránci nechodí za cílem (drží pozici), AI kouzel creepů/obránců není.
+- **Stavba (Human)**: zlato se strhne při příkazu, dělník dojde ke staveništi a teprve pak budovu založí; stavba postupuje jen, když u ní dělník pracuje (animace „Stand Work“ s kladivem), po odchodu se zastaví a nedostavěná věž nefunguje. Pravý klik dělníkem na rozestavěnou budovu práci obnoví; příkaz zrušený před založením (jiný příkaz bez Shiftu, Stop, přeměna) zlato vrátí. Fáze stavby (lešení, sekvence „Birth“) odpovídá postupu.
+- Obránci chodí za cíli v dosahu získání cíle; jejich kouzla kromě Share Mana (autocast) sesílá hráč. Bloodlust creepů se sesílá na creepy útočící na bránu nebo zasažené v posledních 3 s (přesná AI enginu není známa).
 
 ### 6.4 Otevřené body
 
-1. **Video z hraní** – ✅ porovnáno (HUD, střely, výbuchy, náhled nepřátel, zprávy). Zbývá: krvavé skvrny po smrti creepů, ribbony.
+1. **Video z hraní** – ✅ porovnáno (HUD, střely, výbuchy, náhled nepřátel, zprávy, krvavé skvrny po creepech, stopy šípů).
 2. Multiplayer není cílem (rozhodnuto), hraje 1 lokální hráč.
 
 ## 7. Další fáze (návrh)
 
-1. **Prostředí** – rampy (modely přechodů), skybox a DNC osvětlení Ruins (`Environment\DNC\DNCRuins`), animovaná voda ve Spawning Grounds.
-2. **Animace** – doplnit hermite/bezier interpolaci (teď lineární), globální sekvence, náhodné varianty stand podle rarity, animaci upgradu věží a animované doodady (palmy, vlajky).
-3. **Efekty** – Ribbon emittery (stopy šípů), splaty/ubersplaty (krev, stopy výbuchů), lightning efekty (`CLSB`, `CLPB`).
-4. **Zbývající schopnosti** – Bloodlust u Shamanů, aktivní kouzla obránců, Resistant Skin, Asp3.
-5. Testy simulace (např. vitest) nad `Game` bez renderu – průchod vlny, bonusy, porážka/vítězství. Simulace běží synchronně, takže jde spouštět headless (ověřeno: 18 vln zrychleně bez chyb).
+Aktuální seznam je v [dalsi-prace.md](../dalsi-prace.md). Testy (`npm test`) pokrývají start a první vlnu, stavbu
+s dělníkem, odměny a bonus za vlnu, vítězství, ztrátu životů a porážku, prodej, střelbu věží a determinismus
+(`Game.seed(n)` nahradí `Math.random` deterministickým generátorem).
 
-## 8. Známé drobnosti
+## 8. Výkon
+
+- Skinned meshe mají frustum culling podle koule z rozsahu modelu (`extent`, min. poloměr 150).
+- Emise částic se přizpůsobuje snímkové frekvenci (`ParticleSystem.quality` 0,25–1: pod ~30 FPS klesá, nad ~50 FPS roste).
+- Build je rozdělený na chunky: aplikace, `three`, parsery MDX/BLP (`vite.config.ts` → `manualChunks`).
+
+## 9. Známé drobnosti
 
 - Kamera se nenatáčí (yaw), stejně jako ve hře.
 - HP bary jsou sprity (zobrazí je `Alt`); vstupní dialog obtížnosti je pod bílým fade jako v originále.

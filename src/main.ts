@@ -7,11 +7,14 @@ import { layerFromImage } from './render/textures';
 import { RtsCamera } from './render/camera';
 import { WorldView } from './render/world';
 import { Wc3Assets } from './render/mdx';
-import { CREEP_PLAYER, Game, type Unit } from './game/game';
+import { CREEP_PLAYER, ERR, Game, type Unit } from './game/game';
 import { Hud } from './ui/hud';
 import { PortraitView } from './render/portrait';
-import { plainText } from './data/objects';
+import { plainText, wc3ToHtml } from './data/objects';
 import { SoundPlayer } from './sound';
+import { GameCursor, type CursorTint } from './ui/cursor';
+import { GameMenu } from './ui/menu';
+import { DayNight } from './render/daynight';
 
 async function loadJson<T>(url: string): Promise<T | null> {
   try {
@@ -24,21 +27,60 @@ async function loadJson<T>(url: string): Promise<T | null> {
 }
 
 const loadingEl = () => document.getElementById('loading')!;
-/** Loading progress shown on the loading screen; stage timings are kept as performance marks. */
+const STAGES = ['Načítám data mapy…', 'Načítám textury terénu…', 'Stavím terén…', 'Načítám útesy…', 'Rozmisťuji doodady a jednotky…', 'Hotovo'];
+/** Loading progress: label + bar position by stage; stage timings are kept as performance marks. */
 function stage(text: string) {
   performance.mark(text);
-  loadingEl().textContent = text;
+  document.getElementById('loading-label')!.textContent = text;
+  const p = Math.max(0, STAGES.indexOf(text)) / (STAGES.length - 1);
+  const bar = document.getElementById('loading-bar')!;
+  bar.style.setProperty('--p', String(p));
+  (bar.querySelector('.fill') as HTMLElement).style.width = `${(p * 97).toFixed(1)}%`;
+}
+function loadingError(text: string) {
+  document.getElementById('loading-label')!.textContent = text;
+}
+
+/** Loading screen texts from war3map.w3i (name, recommended players, description) and the loading bar textures. */
+async function loadingScreen(map: MapData, assets: Wc3Assets | null) {
+  document.getElementById('loading-title')!.innerHTML = wc3ToHtml(map.info.name);
+  document.getElementById('loading-subtitle')!.innerHTML = map.info.recommendedPlayers ? `Doporučeno hráčů: ${wc3ToHtml(map.info.recommendedPlayers)}` : '';
+  document.getElementById('loading-text')!.innerHTML = wc3ToHtml(map.info.description);
+  if (!assets) return;
+  const url = async (path: string) => {
+    const img = await assets.decodeImage(path).catch(() => null);
+    if (!img) return null;
+    const c = document.createElement('canvas');
+    c.width = img.width;
+    c.height = img.height;
+    c.getContext('2d')!.putImageData(new ImageData(new Uint8ClampedArray(img.data), img.width, img.height), 0, 0);
+    return c.toDataURL();
+  };
+  const bar = document.getElementById('loading-bar')!;
+  for (const [cls, path] of [['bg', 'Textures\\Loading-BarBackground.blp'], ['fill', 'Textures\\Loading-BarFill.blp'], ['glow', 'Textures\\Loading-BarGlow.blp'], ['glass', 'Textures\\Loading-BarGlass.blp']]) {
+    void url(path).then((u) => u && ((bar.querySelector(`.${cls}`) as HTMLElement).style.backgroundImage = `url(${u})`));
+  }
+}
+
+/** UI units of the 0.8 × 0.6 screen (also kept up to date by the HUD) – needed by the loading screen already. */
+function uiScale() {
+  const app = document.getElementById('app')!;
+  app.style.setProperty('--sx', `${innerWidth / 0.8}px`);
+  app.style.setProperty('--sy', `${innerHeight / 0.6}px`);
 }
 
 async function main() {
+  uiScale();
+  addEventListener('resize', uiScale);
   stage('Načítám data mapy…');
   const map = await loadJson<MapData>('map/map.json');
   if (!map) {
-    document.getElementById('loading')!.textContent = 'Chybí public/map/map.json – spusťte "npm run extract".';
+    loadingError('Chybí public/map/map.json – spusťte "npm run extract".');
     return;
   }
   const catalog = await loadJson<AssetCatalog>('war3/catalog.json');
   const assets = catalog ? new Wc3Assets(catalog) : null;
+  void loadingScreen(map, assets);
   const db = new ObjectDB(map, catalog);
   const grid = new TerrainGrid(map.terrain);
 
@@ -49,7 +91,8 @@ async function main() {
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x000000);
-  scene.add(new THREE.AmbientLight(0xffffff, 1.1));
+  const ambient = new THREE.AmbientLight(0xffffff, 1.1);
+  scene.add(ambient);
   const sun = new THREE.DirectionalLight(0xfff2dd, 1.9);
   sun.position.set(-0.3, 0.9, 0.3); // WC3 (-0.3, -0.3, 0.9) in three.js axes
   scene.add(sun);
@@ -77,6 +120,7 @@ async function main() {
   const terrain = buildTerrainMesh(grid, { groundLayers, cliffLayers, cliffGroundTiles, shadows, layerSize, cliffModelTiles: new Set(cliffs.map((c) => c.tile)) });
 
   const game = new Game(map, db, (x, y) => grid.heightAt(x, y), 1);
+  game.cat = catalog;
   const overlay = document.getElementById('float-layer')!;
   const view = new WorldView(scene, game, map, db, grid, assets, overlay);
   view.world.add(terrain.mesh);
@@ -117,24 +161,47 @@ async function main() {
 
   // --- sounds ---------------------------------------------------------------------------------------------
   const sound = new SoundPlayer(assets);
+  sound.listener = () => ({ x: cam.target.x, y: cam.target.y });
+  view.sound = sound;
   game.on('sound', (s) => sound.play(s.file, s.volume, s.pitch));
+  // Interface sounds (UI\SoundInfo\UISounds.slk) of the local player's race.
+  const race = ['', 'Human', 'Orc', 'Undead', 'NightElf'][map.info.players[0]?.race ?? 1] || 'Human';
+  const mine = (u: Unit) => u.owner === hud.localPlayer;
+  game.on('constructed', (u) => mine(u) && sound.playLabel(`JobDoneSound${race}`));
+  game.on('upgraded', (u) => mine(u) && sound.playLabel(`UpgradeComplete${race}`));
+  game.on('researched', (r) => r.owner === hud.localPlayer && sound.playLabel(`ResearchComplete${race}`));
+  game.on('trained', (u) => mine(u) && ack(u, 'Ready'));
+  game.on('error', (e) => e.owner === hud.localPlayer && hud.report(e.text));
+  hud.onError = (err) => sound.playLabel(err === ERR.noGold ? `NoGold${race}` : err === ERR.cantPlace ? `CantPlace${race}` : 'InterfaceError');
+  hud.onCommand = () => sound.playLabel('InterfaceClick');
+  document.addEventListener('click', (e) => {
+    if ((e.target as HTMLElement).closest?.('button')) sound.playLabel('MenuButtonClick');
+  });
+  /**
+   * Unit acknowledgements (UI\SoundInfo\UnitAckSounds.slk, unit field "usnd"): "What" on selection – after
+   * several quick clicks on the same unit the "Pissed" lines –, "Yes" / "YesAttack" on orders, "Ready" when trained.
+   */
+  function ack(u: Unit | null | undefined, kind: 'What' | 'Yes' | 'YesAttack' | 'Ready' | 'Pissed') {
+    const base = u ? String(u.def.fields.usnd ?? '').trim() : '';
+    if (!base) return;
+    const label = sound.has(base + kind) ? base + kind : kind === 'YesAttack' || kind === 'Ready' ? base + 'Yes' : kind === 'Pissed' ? base + 'What' : '';
+    sound.playLabel(label, { ack: true });
+  }
+  let clicks = { uid: -1, n: 0, t: 0 };
+  const ackSelect = (u: Unit | null) => {
+    if (!u) return;
+    const now = performance.now();
+    clicks = clicks.uid === u.uid && now - clicks.t < 1500 ? { uid: u.uid, n: clicks.n + 1, t: now } : { uid: u.uid, n: 1, t: now };
+    ack(u, clicks.n >= 4 ? 'Pissed' : 'What');
+  };
   // war3map.j main(): SetMapMusic("Music", true, 0) → race playlist from UI\war3skins.txt.
   if (catalog?.music) sound.startMusic(catalog.music);
-  const musicBtn = document.getElementById('btn-music')!;
-  musicBtn.hidden = !sound.hasMusic;
-  const musicLabel = () => {
-    musicBtn.classList.toggle('on', sound.musicOn);
-    musicBtn.textContent = `Hudba: ${sound.musicOn ? 'zapnuta' : 'vypnuta'}`;
-  };
-  musicLabel();
-  musicBtn.addEventListener('click', () => {
-    sound.toggleMusic();
-    musicLabel();
-  });
+  new GameMenu(game, hud, sound, cam);
 
   stage('Rozmisťuji doodady a jednotky…');
   await view.buildStatic();
   game.start();
+  view.buildDestructables();
   const myBuilder = game.units.find((u) => u.kind === 'builder' && u.owner === 0);
   if (myBuilder) cam.panTo(myBuilder.x, myBuilder.y);
   hud.onMinimapClick = (x, y) => cam.panTo(x, y);
@@ -151,8 +218,38 @@ async function main() {
   const select = (u: Unit | null) => setSelection(u ? [u] : []);
   hud.onSelect = (u) => {
     select(u);
+    ackSelect(u);
     if (u) cam.panTo(u.x, u.y);
   };
+
+  // --- control groups (Ctrl+0–9 assign, Shift+0–9 add, 0–9 select, twice = jump to the group) ---------------
+  // Physical keys (KeyboardEvent.code), so the Czech layout's number row (+ěščřžýáíé) works too.
+  const groups: Unit[][] = Array.from({ length: 10 }, () => []);
+  let lastGroup = { n: -1, t: 0 };
+  addEventListener('keydown', (e) => {
+    const m = /^(?:Digit|Numpad)([0-9])$/.exec(e.code);
+    if (!m || (e.target as HTMLElement)?.tagName === 'INPUT' || e.altKey) return;
+    const n = Number(m[1]);
+    const own = group.filter((u) => u.alive && mine(u));
+    if (e.ctrlKey || e.metaKey) {
+      e.preventDefault();
+      if (own.length) groups[n] = own;
+      return;
+    }
+    if (e.shiftKey) {
+      e.preventDefault();
+      groups[n] = [...new Set([...groups[n], ...own])].slice(0, 12);
+      return;
+    }
+    groups[n] = groups[n].filter((u) => u.alive && game.units.includes(u));
+    if (!groups[n].length) return;
+    e.preventDefault();
+    const now = performance.now();
+    if (lastGroup.n === n && now - lastGroup.t < 400) cam.panTo(groups[n][0].x, groups[n][0].y);
+    lastGroup = { n, t: now };
+    setSelection(groups[n]);
+    ack(groups[n][0], 'What');
+  });
 
   // --- pathing overlay (F3) -------------------------------------------------------------------------
   const pathTex = new THREE.DataTexture(new Uint8Array(game.grid.width * game.grid.height * 4), game.grid.width, game.grid.height, THREE.RGBAFormat);
@@ -221,10 +318,15 @@ async function main() {
   const creepName = map.info.players.find((p) => p.id === CREEP_PLAYER)?.name ?? 'Creeps';
   const ownerName = (u: Unit) =>
     u.owner === CREEP_PLAYER ? { name: creepName, color: '#ff0303' } : u.owner < game.players.length ? { name: game.players[u.owner].name, color: game.players[u.owner].color } : { name: plainText(u.def.name), color: '#ffffff' };
-  canvas.addEventListener('mouseleave', () => view.setHover(null, ownerName));
+  let hoverUnit: Unit | null = null;
+  canvas.addEventListener('mouseleave', () => {
+    hoverUnit = null;
+    view.setHover(null, ownerName);
+  });
   canvas.addEventListener('mousemove', (e) => {
     const [mx, my] = mousePos(e);
-    view.setHover(drag?.active ? null : view.pick(mx, my, cam.camera, canvas.clientWidth, canvas.clientHeight), ownerName);
+    hoverUnit = drag?.active ? null : view.pick(mx, my, cam.camera, canvas.clientWidth, canvas.clientHeight);
+    view.setHover(hoverUnit, ownerName);
     if (drag) {
       drag.cx = mx;
       drag.cy = my;
@@ -254,6 +356,14 @@ async function main() {
     } else {
       const u = view.pick(d.x, d.y, cam.camera, W, H);
       picked = u ? [u] : [];
+      // Double click / Ctrl+click: all own units of that type on the screen.
+      const now = performance.now();
+      const double = !!u && lastClick.uid === u.uid && now - lastClick.t < 350;
+      lastClick = { uid: u?.uid ?? -1, t: now };
+      if (u && mine(u) && (double || e.ctrlKey)) {
+        const same = view.unitsInRect(0, 0, W, H, cam.camera, W, H).filter((x) => x.def.id === u.def.id && x.owner === u.owner);
+        picked = [u, ...same.filter((x) => x !== u)];
+      }
     }
     if (e.shiftKey && selected && selected.owner === hud.localPlayer) {
       const next = [...group];
@@ -264,8 +374,12 @@ async function main() {
         else if (i < 0) next.push(u);
       }
       setSelection(next);
-    } else setSelection(picked);
+    } else {
+      setSelection(picked);
+      ackSelect(picked[0] ?? null);
+    }
   };
+  let lastClick = { uid: -1, t: 0 };
   addEventListener('mouseup', (e) => {
     if (e.button === 0) finishSelection(e);
   });
@@ -286,7 +400,12 @@ async function main() {
       if (hud.mode.kind === 'build') {
         const pt = groundPoint(mx, my);
         if (pt && selected) {
-          hud.report(game.build(selected, hud.mode.id, pt.x, pt.y));
+          const err = game.build(selected, hud.mode.id, pt.x, pt.y, e.shiftKey);
+          hud.report(err);
+          if (!err) {
+            sound.playLabel('PlaceBuildingDefault');
+            ack(selected, 'Yes');
+          }
           if (!e.shiftKey) {
             hud.mode = { kind: 'normal' };
             hud.submenu = null;
@@ -297,20 +416,43 @@ async function main() {
       }
       if (hud.mode.kind === 'target' && selected) {
         const target = view.pick(mx, my, cam.camera, canvas.clientWidth, canvas.clientHeight);
-        if (hud.mode.ability === 'coin') {
-          if (target && target.owner === CREEP_PLAYER) hud.report(game.coinBash(selected, target));
-          else hud.report('Must target a creep.');
+        if (hud.mode.ability === 'drain' && hud.mode.id) {
+          if (target) {
+            const err = game.castDrain(selected, hud.mode.id, target);
+            hud.report(err);
+            if (!err) ack(selected, 'YesAttack');
+          } else hud.report(ERR.targetEnemy);
+        } else if (hud.mode.ability === 'storm' && hud.mode.id) {
+          const pt = groundPoint(mx, my);
+          if (pt) {
+            const err = game.castStorm(selected, hud.mode.id, pt.x, pt.y);
+            hud.report(err);
+            if (!err) ack(selected, 'YesAttack');
+          }
+        } else if (hud.mode.ability === 'coin') {
+          if (target && target.owner === CREEP_PLAYER) {
+            const err = game.coinBash(selected, target);
+            hud.report(err);
+            if (!err) ack(selected, 'YesAttack');
+          } else hud.report(ERR.targetEnemy);
         } else if (hud.mode.ability === 'move') {
           const pt = groundPoint(mx, my);
-          if (pt && groupMove(group, pt.x, pt.y)) view.orderConfirmation(pt.x, pt.y);
+          if (pt && groupMove(group, pt.x, pt.y)) {
+            view.orderConfirmation(pt.x, pt.y);
+            ack(selected, 'Yes');
+          }
         } else if (hud.mode.ability === 'attack') {
           const own = group.filter((u) => u.alive && u.owner === hud.localPlayer);
           if (target && target.owner === CREEP_PLAYER && own.some((u) => u.def.attack)) {
             for (const u of own) if (u.def.attack) game.orderAttack(u, target);
             view.orderConfirmation(target.x, target.y, 'attack', true);
+            ack(own.find((u) => u.def.attack), 'YesAttack');
           } else {
             const pt = groundPoint(mx, my);
-            if (pt && groupMove(own, pt.x, pt.y)) view.orderConfirmation(pt.x, pt.y, 'attack');
+            if (pt && groupMove(own, pt.x, pt.y)) {
+              view.orderConfirmation(pt.x, pt.y, 'attack');
+              ack(selected, 'YesAttack');
+            }
           }
         }
         hud.mode = { kind: 'normal' };
@@ -326,18 +468,63 @@ async function main() {
       const own = group.filter((u) => u.alive && u.owner === hud.localPlayer);
       if (!own.length) return;
       const target = view.pick(mx, my, cam.camera, canvas.clientWidth, canvas.clientHeight);
-      if (target && target.owner === CREEP_PLAYER && own.some((u) => u.def.attack)) {
+      const builders = own.filter((u) => u.kind === 'builder');
+      if (target && target.constructing && mine(target) && builders.length) {
+        // Resume an unfinished building.
+        for (const b of builders) game.resumeConstruction(b, target);
+        view.orderConfirmation(target.x, target.y, 'move', true);
+        ack(builders[0], 'Yes');
+      } else if (target && target.owner === CREEP_PLAYER && own.some((u) => u.def.attack)) {
         for (const u of own) if (u.def.attack) game.orderAttack(u, target);
         view.orderConfirmation(target.x, target.y, 'attack', true);
+        ack(own.find((u) => u.def.attack), 'YesAttack');
       } else {
         const pt = groundPoint(mx, my);
-        if (pt && groupMove(own, pt.x, pt.y)) view.orderConfirmation(pt.x, pt.y);
+        if (pt && groupMove(own, pt.x, pt.y)) {
+          view.orderConfirmation(pt.x, pt.y);
+          ack(own.find((u) => u.speed > 0), 'Yes');
+        }
       }
     }
   });
 
+  // --- cursor (UI\Cursor\HumanCursor.mdl) ---------------------------------------------------------------
+  const cursor = new GameCursor();
+  if (assets && catalog?.ui?.cursor) void cursor.load(assets, catalog.ui.cursor);
+  let overCanvas = false;
+  addEventListener('mousemove', (e) => (overCanvas = e.target === canvas));
+  const allegiance = (u: Unit): CursorTint => (u.owner === CREEP_PLAYER ? 'enemy' : u.owner < CREEP_PLAYER ? 'friend' : 'neutral');
+  const updateCursor = (dt: number) => {
+    const [ex, ey] = cam.edge;
+    const hover = overCanvas ? hoverUnit : null;
+    if (ex || ey) cursor.set('Scroll', 'none', [ex, ey]);
+    else if (hud.mode.kind === 'target') cursor.set(hover ? 'TargetSelect' : 'Target', hover ? allegiance(hover) : 'none');
+    else if (hover && !drag?.active && hud.mode.kind === 'normal') cursor.set('Select');
+    else cursor.set('Normal');
+    cursor.update(dt);
+  };
+
   stage('Hotovo');
   loadingEl().hidden = true;
+
+  // --- day / night (Environment\\DNC): the calibrated noon lighting is multiplied by the DNC colours -------------
+  const dayNight = assets && catalog?.ui?.dnc ? await DayNight.load(assets, catalog.ui.dnc.terrain, catalog.ui.dnc.unit) : null;
+  const base = {
+    ambient: ambient.color.clone(),
+    sun: sun.color.clone(),
+    tAmbient: (terrain.material.uniforms.uAmbient.value as THREE.Color).clone(),
+    tSun: (terrain.material.uniforms.uSun.value as THREE.Color).clone(),
+  };
+  const mul = (out: THREE.Color, b: THREE.Color, f: number[]) => out.setRGB(b.r * f[0], b.g * f[1], b.b * f[2]);
+  const updateLighting = () => {
+    if (!dayNight) return;
+    // Same clock as the console: the game day lasts 8 minutes and starts at 8:00.
+    const f = dayNight.factors((8 + (game.time * 24) / 480) % 24);
+    mul(ambient.color, base.ambient, f.unitAmbient);
+    mul(sun.color, base.sun, f.unitDiffuse);
+    mul(terrain.material.uniforms.uAmbient.value, base.tAmbient, f.terrainAmbient);
+    mul(terrain.material.uniforms.uSun.value, base.tSun, f.terrainDiffuse);
+  };
 
   // --- loop ----------------------------------------------------------------------------------------------
   let last = performance.now();
@@ -350,7 +537,11 @@ async function main() {
     }
     return pts;
   };
+  // Particle budget follows the frame rate: below ~30 FPS emitters thin out, above ~50 FPS they recover.
+  let avgDt = 1 / 60;
   const frame = (dt: number) => {
+    avgDt = avgDt * 0.95 + dt * 0.05;
+    view.particles.quality = Math.max(0.25, Math.min(1, view.particles.quality * (avgDt > 1 / 30 ? 0.995 : avgDt < 1 / 50 ? 1.01 : 1)));
     game.update(dt);
     cam.update(dt);
     // Dead / removed units drop out of the selection (a dying creep stays selected until removed, as in WC3).
@@ -359,6 +550,8 @@ async function main() {
     }
     if (hud.mode.kind !== 'build') view.showGhost(null);
     view.update(dt, cam.camera, canvas.clientWidth, canvas.clientHeight);
+    updateCursor(dt);
+    updateLighting();
     hud.update(selected);
     portrait.setUnit(selected && (selected.alive || selected.owner === CREEP_PLAYER) ? selected : null);
     portrait.update(game.paused ? 0 : dt);
@@ -384,5 +577,5 @@ async function main() {
 
 main().catch((e) => {
   console.error(e);
-  document.getElementById('loading')!.textContent = `Chyba: ${e?.message ?? e}`;
+  loadingError(`Chyba: ${e?.message ?? e}`);
 });

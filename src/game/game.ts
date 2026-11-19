@@ -1,4 +1,4 @@
-import type { GameConfig, MapData } from '../data/types';
+import type { AssetCatalog, GameConfig, MapData } from '../data/types';
 import { ObjectDB, type UnitDef } from '../data/objects';
 import { PathingGrid } from './pathing';
 import { armorMultiplier, attackMultiplier, randomInt, rollDamage } from './combat';
@@ -38,13 +38,34 @@ export interface Unit {
   barrageCd: number;
   abilityCd: Record<string, number>;
   constructing: { total: number; elapsed: number } | null;
+  /** Builder: ordered constructions (gold already paid, refunded when the order is dropped before the site is founded). */
+  buildQueue: { id: string; x: number; y: number }[];
+  /** Builder: the unfinished building it works on – construction only progresses while it stands there. */
+  constructs: Unit | null;
+  /** Mana (unit fields umpi initial, umpm maximum, umpr regeneration per second). */
+  mana: number;
+  maxMana: number;
+  manaRegen: number;
+  /** Active buffs by buff id (Bblo bloodlust, B002 blessed weapons, Bdtm drained …) with their effect values. */
+  buffs: Record<string, { until: number; move?: number; attack?: number; scale?: number; damage?: number }>;
+  /** Autocast state of abilities (Share Mana). */
+  autocast: Record<string, boolean>;
+  /** Last time the unit took damage – creep spell casters react to combat. */
+  lastDamaged: number;
+  /** Hold Position: the unit attacks only what is in range and never chases. */
+  holdPosition: boolean;
+  /** Target the unit walks to (auto-acquired within acquisition range or ordered); path refresh time. */
+  chase: Unit | null;
+  chaseRepath: number;
+  /** Channelled Mana Drain. */
+  drain: { target: Unit; until: number; rate: number; range: number; ability: string } | null;
   upgrading: { to: string; total: number; elapsed: number } | null;
   queue: { kind: 'train' | 'research'; id: string; level: number; total: number; elapsed: number }[];
   userData: number;
   rects: Set<string>;
   kills: number;
   /** Visual animation hint for the renderer. */
-  anim: 'stand' | 'walk' | 'attack' | 'death' | 'birth';
+  anim: 'stand' | 'walk' | 'attack' | 'death' | 'birth' | 'work';
   animTime: number;
   removeAt: number;
   footprint: number;
@@ -70,8 +91,9 @@ export interface Missile {
   damage: number;
   bounce: { left: number; factor: number; loss: number; range: number; hit: Set<number> } | null;
   isAbility: boolean;
-  /** Stun duration applied on impact instead of damage (Coin Basher). */
+  /** Stun duration applied on impact instead of damage (Coin Basher); `stunHero` for resistant targets. */
   stun: number;
+  stunHero?: number;
   color: number;
   model: string;
   done: boolean;
@@ -99,6 +121,9 @@ export interface PlayerState {
   gold: number;
   kills: number;
   research: Record<string, number>;
+  /** Score screen: gold from bounties and wave bonuses, buildings founded. */
+  earned: number;
+  built: number;
 }
 
 type Events = {
@@ -107,22 +132,62 @@ type Events = {
   sound: { file: string; volume?: number; pitch?: number; x?: number; y?: number };
   floatText: { text: string; x: number; y: number; color: string; lifespan: number };
   effect: { model: string; x: number; y: number; color: number };
-  lightning: { from: Unit; to: Unit; color: number };
+  /** Instant attack (missile speed 0): lightning from the attacker to the target, the weapon's model plays at the target. */
+  lightning: { from: Unit; to: Unit; color: number; model: string };
   fade: { dir: 'in' | 'out'; duration: number };
   dialog: { title: string; buttons: { label: string; id: number }[]; timeout: number } | null;
   doodadAnim: { id: string; anim: 'birth' | 'death' };
   unitAdded: Unit;
   unitRemoved: Unit;
   missileAdded: Missile;
+  /** Instant weapon hit: impact sound = weapon sound (ucs1) + target armour sound (UI\SoundInfo\UnitCombatSounds.slk). */
+  combatHit: { weaponSound: string; armor: string; x: number; y: number };
+  /** A buff was applied to / removed from a unit (its art is attached to the model). */
+  buff: { unit: Unit; id: string; on: boolean };
+  /** One-shot spell art at a place (caster / target / effect art of an ability or buff). */
+  spellArt: { model: string; x: number; y: number; unit?: Unit; sound?: string };
+  /** Lasting lightning between two units (Mana Drain), until `until` (game time) or `link` set to null. */
+  link: { id: number; from: Unit; to: Unit; lightning: string; until: number };
+  /** Error of an order that failed later (shown like a HUD error to its owner). */
+  error: { owner: number; text: string };
   /** Construction or upgrade finished (engine message "Dokončeno: …"). */
   completed: Unit;
+  /** Construction / upgrade of a building finished (emitted together with `completed`). */
+  constructed: Unit;
+  upgraded: Unit;
+  /** A unit was trained (its "Ready" acknowledgement plays). */
+  trained: Unit;
+  researched: { owner: number; id: string; level: number };
   end: { victory: boolean; text: string };
   quest: void;
 };
 
 export const PLAYER_COLORS = ['#ff0303', '#0042ff', '#1ce6b9', '#540081', '#fffc01', '#fe8a0e', '#20c000', '#e55bb0', '#959697', '#7ebff1', '#106246', '#4a2a04'];
 const PLAYER_NAMES = ['Player 1 (Red)', 'Player 2 (Blue)', 'Player 3 (Teal)'];
+/**
+ * Engine messages in the wording of the Czech client (Units\CommandStrings.txt, UI\FrameDef\GlobalStrings.fdf);
+ * texts from the map itself stay as the map has them (English).
+ */
+export const ERR = {
+  noGold: 'Nedostatek zlata.', // Nogold
+  cantPlace: 'Zde nelze stavět.', // Cantplace
+  cooldown: 'Kouzlo zatím není připraveno.', // Cooldown
+  notInRange: 'Cíl je mimo dostřel.', // Notinrange
+  outOfStock: 'Vyprodáno', // Outofstock
+  targetEnemy: 'Cílem musí být nepřátelská jednotka.', // Targetenemy
+  requires: 'Požadavky:', // REQUIRESTOOLTIP
+  miss: 'minul', // MISS
+  noMana: 'Nedostatek many.', // Nomana
+  targetManaUser: 'Cílem musí být jednotka s manou.', // Targetmanauser
+  busy: 'Budova je zaneprázdněná.',
+  queueFull: 'Fronta je plná.',
+  researched: 'Již vyzkoumáno.',
+};
 export const CREEP_PLAYER = 3;
+/** Numeric object field ('-' / '' / missing = 0). */
+const num = (v: unknown) => (typeof v === 'number' ? v : Number(v) || 0);
+/** Distance from the centre of a building site at which a builder founds / works on it. */
+const BUILD_REACH = 150;
 export const NEUTRAL_PASSIVE = 15;
 
 export class Game {
@@ -155,6 +220,10 @@ export class Game {
   private uidSeq = 1;
   private missileSeq = 1;
   /** Attacks between the start of the swing and their damage point. */
+  /** Skyfury storms in progress. */
+  storms: { x: number; y: number; owner: number; source: Unit; until: number; next: number; interval: number; damage: number; radius: number; buff: string }[] = [];
+  /** Asset catalog (buff art, ability sounds) – optional, set by the renderer side. */
+  cat: AssetCatalog | null = null;
   private pendingShots: { u: Unit; t: Unit; at: number; auras: ReturnType<Game['auraSources']> }[] = [];
   /** Trigger "threads": generators that yield the number of seconds to sleep (TriggerSleepAction). */
   private threads: { gen: Thread; at: number; seq: number }[] = [];
@@ -223,7 +292,7 @@ export class Game {
 
   start() {
     for (let i = 0; i < 3; i++) {
-      this.players.push({ id: i, name: PLAYER_NAMES[i], color: PLAYER_COLORS[i], playing: i < this.humanPlayers, gold: 0, kills: 0, research: {} });
+      this.players.push({ id: i, name: PLAYER_NAMES[i], color: PLAYER_COLORS[i], playing: i < this.humanPlayers, gold: 0, kills: 0, research: {}, earned: 0, built: 0 });
     }
     for (const d of this.cfg.destructables) {
       const hp = this.db.destructableLife(d.id);
@@ -311,6 +380,18 @@ export class Game {
       barrageCd: 0,
       abilityCd: {},
       constructing: null,
+      buildQueue: [],
+      constructs: null,
+      mana: num(def.fields.umpi),
+      maxMana: num(def.fields.umpm),
+      manaRegen: num(def.fields.umpr),
+      buffs: {},
+      autocast: {},
+      lastDamaged: -Infinity,
+      holdPosition: false,
+      chase: null,
+      chaseRepath: 0,
+      drain: null,
       upgrading: null,
       queue: [],
       userData: 0,
@@ -461,7 +542,10 @@ export class Game {
       return;
     }
     const bonus = this.wave * 10 + Math.floor((this.wave * this.wave) / this.playerCount);
-    for (const p of this.players) if (p.playing) p.gold += bonus;
+    for (const p of this.players) if (p.playing) {
+      p.gold += bonus;
+      p.earned += bonus;
+    }
     this.message(`All players receive |cffffcc00${bonus} |rextra gold for surviving the wave.`);
     this.playSound('gg_snd_GoodJob');
     this.multiboardTitle = `Wave ${this.wave} completed!`;
@@ -658,37 +742,19 @@ export class Game {
     return this.grid.canBuild(x, y, 4);
   }
 
-  build(builder: Unit, id: string, x: number, y: number): string | null {
-    const def = this.db.unit(id);
-    const p = this.players[builder.owner];
-    const missing = this.missingRequirements(builder.owner, def);
-    if (missing.length) return `Requires: ${missing.join(', ')}`;
-    if (p.gold < def.gold) return 'Not enough gold.';
-    [x, y] = this.grid.snap(x, y, 4);
-    if (!this.grid.canBuild(x, y, 4)) return 'Unable to build there.';
-    p.gold -= def.gold;
-    const t = this.createUnit(id, builder.owner, x, y, (270 * Math.PI) / 180);
-    t.constructing = { total: Math.max(0.1, def.buildTime), elapsed: 0 };
-    t.hp = Math.max(1, def.hp * 0.1);
-    t.anim = 'birth';
-    // Builder walks next to the site (construction itself runs independently).
-    this.orderMove(builder, x - 90, y - 90);
-    return null;
-  }
-
   /** Like the engine: object gold costs of upgraded structures are cumulative, an upgrade charges the difference. */
   upgradeCost(tower: Unit, to: string) {
     return Math.max(0, this.db.unit(to).gold - tower.def.gold);
   }
 
   upgrade(tower: Unit, to: string): string | null {
-    if (tower.constructing || tower.upgrading) return 'Busy.';
+    if (tower.constructing || tower.upgrading) return ERR.busy;
     const def = this.db.unit(to);
     const p = this.players[tower.owner];
     const missing = this.missingRequirements(tower.owner, def);
-    if (missing.length) return `Requires: ${missing.join(', ')}`;
+    if (missing.length) return `${ERR.requires} ${missing.join(', ')}`;
     const cost = this.upgradeCost(tower, to);
-    if (p.gold < cost) return 'Not enough gold.';
+    if (p.gold < cost) return ERR.noGold;
     p.gold -= cost;
     tower.upgrading = { to, total: Math.max(0.1, def.buildTime), elapsed: 0 };
     return null;
@@ -708,6 +774,311 @@ export class Game {
     }
   }
 
+  /**
+   * Human construction like the engine: the order costs the gold at once, the builder walks to the site and only
+   * then founds the building; it keeps working on it (hammer animation, "Stand Work") and construction progresses
+   * only while it stays. Leaving pauses the building – it is not functional until another order to the
+   * unfinished building (right click) resumes the work. Shift queues further buildings.
+   */
+  build(builder: Unit, id: string, x: number, y: number, queued = false): string | null {
+    const def = this.db.unit(id);
+    const p = this.players[builder.owner];
+    const missing = this.missingRequirements(builder.owner, def);
+    if (missing.length) return `${ERR.requires} ${missing.join(', ')}`;
+    [x, y] = this.grid.snap(x, y, 4);
+    // Without Shift the builder's own planned buildings are dropped (refunded) by this order.
+    const refund = queued ? 0 : builder.buildQueue.reduce((n, q) => n + this.db.unit(q.id).gold, 0);
+    const taken = this.plannedSites(queued ? null : builder).some((s) => Math.abs(s.x - x) < 128 && Math.abs(s.y - y) < 128);
+    if (!this.grid.canBuild(x, y, 4) || taken) return ERR.cantPlace;
+    if (p.gold + refund < def.gold) return ERR.noGold;
+    if (!queued) this.clearOrders(builder);
+    p.gold -= def.gold;
+    builder.buildQueue.push({ id, x, y });
+    if (builder.buildQueue.length === 1 && !builder.constructs) this.approachSite(builder);
+    return null;
+  }
+
+  /** Paid construction orders whose builder has not reached the site yet. */
+  plannedSites(except: Unit | null = null) {
+    const out: { id: string; x: number; y: number; owner: number }[] = [];
+    for (const u of this.units) if (u.alive && u !== except) for (const b of u.buildQueue) out.push({ ...b, owner: u.owner });
+    return out;
+  }
+
+  /** Right click on an own unfinished building: the builder resumes its construction. */
+  resumeConstruction(builder: Unit, site: Unit): boolean {
+    if (builder.kind !== 'builder' || !site.alive || !site.constructing || site.owner !== builder.owner) return false;
+    this.clearOrders(builder);
+    builder.constructs = site;
+    this.approach(builder, site.x, site.y);
+    return true;
+  }
+
+  /** Drops pending construction orders (refund) and stops working on a building. */
+  private clearOrders(u: Unit) {
+    if (u.buildQueue.length) {
+      const p = this.players[u.owner];
+      for (const b of u.buildQueue) if (p) p.gold += this.db.unit(b.id).gold;
+      u.buildQueue = [];
+    }
+    u.constructs = null;
+    if (u.anim === 'work') u.anim = 'stand';
+  }
+
+  private approachSite(u: Unit) {
+    const b = u.buildQueue[0];
+    if (b) this.approach(u, b.x, b.y);
+  }
+
+  /** Walks next to a building site (its footprint is 4×4 cells = 128 units). */
+  private approach(u: Unit, x: number, y: number) {
+    const d = Math.hypot(u.x - x, u.y - y);
+    if (d <= BUILD_REACH) return;
+    const k = (d - 110) / d;
+    this.moveTo(u, x + (u.x - x) * (1 - k), y + (u.y - y) * (1 - k));
+  }
+
+  /** Construction orders of a builder, run every tick. */
+  private updateBuilder(u: Unit) {
+    const site = u.constructs;
+    if (site) {
+      if (!site.alive || !site.constructing || !this.units.includes(site)) {
+        u.constructs = null;
+        if (u.anim === 'work') u.anim = 'stand';
+        this.approachSite(u);
+        return;
+      }
+      if (Math.hypot(site.x - u.x, site.y - u.y) > BUILD_REACH) {
+        if (!u.path) this.approach(u, site.x, site.y);
+        return;
+      }
+      u.path = null;
+      u.moveTarget = null;
+      u.facing = Math.atan2(site.y - u.y, site.x - u.x);
+      u.anim = 'work';
+      return;
+    }
+    const b = u.buildQueue[0];
+    if (!b) return;
+    const d = Math.hypot(b.x - u.x, b.y - u.y);
+    if (d > BUILD_REACH && u.path) return;
+    // At the site (or as close as the path got): found the building; the place may have been taken meanwhile → refund.
+    u.buildQueue.shift();
+    u.moveTarget = null;
+    const def = this.db.unit(b.id);
+    if (d > BUILD_REACH * 2.5 || !this.grid.canBuild(b.x, b.y, 4)) {
+      this.players[u.owner].gold += def.gold;
+      this.emit('error', { owner: u.owner, text: ERR.cantPlace });
+      this.approachSite(u);
+      return;
+    }
+    const t = this.createUnit(b.id, u.owner, b.x, b.y, (270 * Math.PI) / 180);
+    t.constructing = { total: Math.max(0.1, def.buildTime), elapsed: 0 };
+    t.hp = Math.max(1, def.hp * 0.1);
+    t.anim = 'birth';
+    u.constructs = t;
+    this.players[u.owner].built++;
+  }
+
+  // --- spells ----------------------------------------------------------------------------------
+
+  /** Resistant Skin (ACrk): negative spells last only their hero duration (ahdu) like on heroes. */
+  private resistant(u: Unit) {
+    return u.def.abilities.some((id) => this.db.ability(id).base === 'ACrk');
+  }
+
+  private spellDuration(t: Unit, f: Record<string, string | number>, fallback: number) {
+    const normal = Number(f['adur@1'] ?? fallback);
+    return this.resistant(t) ? Math.min(normal, Number(f['ahdu@1'] ?? normal)) : normal;
+  }
+
+  applyBuff(u: Unit, id: string, duration: number, data: Omit<Unit['buffs'][string], 'until'>) {
+    const had = !!u.buffs[id];
+    u.buffs[id] = { ...data, until: Math.max(u.buffs[id]?.until ?? 0, this.time + duration) };
+    if (!had) this.emit('buff', { unit: u, id, on: true });
+  }
+
+  private removeBuff(u: Unit, id: string) {
+    if (!u.buffs[id]) return;
+    delete u.buffs[id];
+    this.emit('buff', { unit: u, id, on: false });
+  }
+
+  private buffSum(u: Unit, key: 'move' | 'attack' | 'scale' | 'damage') {
+    let s = 0;
+    for (const b of Object.values(u.buffs)) s += b[key] ?? 0;
+    return s;
+  }
+
+  /** Model scale factor from buffs (Bloodlust makes units bigger). */
+  buffScale(u: Unit) {
+    return 1 + this.buffSum(u, 'scale');
+  }
+
+  private art(ab: { fields: Record<string, string | number> }, field: 'acat' | 'atat' | 'asat' | 'aeat') {
+    return String(ab.fields[field] ?? '').split(',')[0].trim();
+  }
+
+  /** Per-unit spell logic: creep autocasts (Bloodlust), Share Mana autocast, Mana Drain channel, Skyfury storms. */
+  private updateSpells(u: Unit, dt: number) {
+    if (u.drain) this.updateDrain(u, dt);
+    for (const id of u.def.abilities) {
+      const ab = this.db.ability(id);
+      if ((u.abilityCd[id] ?? 0) > this.time) continue;
+      const f = ab.fields;
+      const cost = Number(f['amcs@1'] ?? 0);
+      if (u.mana < cost) continue;
+      if (ab.base === 'Ablo' && u.owner === CREEP_PLAYER) {
+        // Computer-controlled casters autocast Bloodlust on allies in combat (attacking the gate or under fire).
+        const range = Number(f['aran@1'] ?? 600);
+        const buff = String(f['abuf@1'] ?? 'Bblo');
+        const target = this.units.find((c) => c.alive && c.owner === u.owner && !c.hidden && !c.buffs[buff] && (c.attackGate || this.time - c.lastDamaged < 3) && Math.hypot(c.x - u.x, c.y - u.y) <= range);
+        if (!target) continue;
+        u.abilityCd[id] = this.time + Number(f['acdn@1'] ?? 1);
+        u.mana -= cost;
+        this.applyBuff(target, buff, this.spellDuration(target, f, 60), { attack: Number(f['Blo1@1'] ?? 0), move: Number(f['Blo2@1'] ?? 0), scale: Number(f['Blo3@1'] ?? 0) });
+      } else if (ab.base === 'Arpm' && u.autocast[id] !== false && u.owner !== CREEP_PLAYER) {
+        this.castShareMana(u, id, true);
+      }
+    }
+    for (const s of this.storms) if (s.next <= this.time && s.until > this.time) this.stormStrike(s);
+    this.storms = this.storms.filter((s) => s.until > this.time);
+  }
+
+  /** Arpm (Share Mana): restores Rpb6 mana to nearby allies that miss it (autocast or by hand). */
+  castShareMana(u: Unit, id: string, auto = false): string | null {
+    const ab = this.db.ability(id);
+    const f = ab.fields;
+    if ((u.abilityCd[id] ?? 0) > this.time) return ERR.cooldown;
+    const cost = Number(f['amcs@1'] ?? 0);
+    if (u.mana < cost) return ERR.noMana;
+    const amount = Number(f['Rpb6@1'] ?? 10);
+    const area = Number(f['aare@1'] ?? 500);
+    const allies = this.units.filter((c) => c.alive && c !== u && c.owner === u.owner && c.maxMana > 0 && c.maxMana - c.mana >= (auto ? amount : 1) && Math.hypot(c.x - u.x, c.y - u.y) <= area);
+    if (!allies.length) return auto ? null : ERR.targetManaUser;
+    u.mana -= cost;
+    u.abilityCd[id] = this.time + Number(f['acdn@1'] ?? 1);
+    this.emit('spellArt', { model: this.art(ab, 'acat'), x: u.x, y: u.y, unit: u, sound: this.cat?.abilityFx?.[ab.base]?.effectSound });
+    for (const c of allies) {
+      c.mana = Math.min(c.maxMana, c.mana + amount);
+      this.emit('spellArt', { model: this.art(ab, 'atat'), x: c.x, y: c.y, unit: c });
+    }
+    return null;
+  }
+
+  /** ACro (Bless Weapons, a Roar): +Roa1 damage for own units around the caster. */
+  castRoar(u: Unit, id: string): string | null {
+    const ab = this.db.ability(id);
+    const f = ab.fields;
+    if ((u.abilityCd[id] ?? 0) > this.time) return ERR.cooldown;
+    const cost = Number(f['amcs@1'] ?? 0);
+    if (u.mana < cost) return ERR.noMana;
+    u.mana -= cost;
+    u.abilityCd[id] = this.time + Number(f['acdn@1'] ?? 10);
+    const area = Number(f['aare@1'] ?? 600);
+    const buff = String(f['abuf@1'] ?? 'Broa').split(',')[0];
+    this.emit('spellArt', { model: this.art(ab, 'acat'), x: u.x, y: u.y, unit: u });
+    for (const c of this.units) {
+      if (!c.alive || c.owner !== u.owner || c.def.isBuilding || !c.def.attack || Math.hypot(c.x - u.x, c.y - u.y) > area) continue;
+      this.applyBuff(c, buff, Number(f['adur@1'] ?? 45), { damage: Number(f['Roa1@1'] ?? 0) });
+    }
+    return null;
+  }
+
+  /** AHdr (Mana Drain): channels Ndr2 mana per second from an enemy into the caster. */
+  castDrain(u: Unit, id: string, target: Unit): string | null {
+    const ab = this.db.ability(id);
+    const f = ab.fields;
+    if ((u.abilityCd[id] ?? 0) > this.time) return ERR.cooldown;
+    if (target.owner !== CREEP_PLAYER || !target.alive) return ERR.targetEnemy;
+    if (target.maxMana <= 0) return ERR.targetManaUser;
+    if (Math.hypot(target.x - u.x, target.y - u.y) > Number(f['aran@1'] ?? 900)) return ERR.notInRange;
+    const cost = Number(f['amcs@1'] ?? 0);
+    if (u.mana < cost) return ERR.noMana;
+    u.mana -= cost;
+    u.abilityCd[id] = this.time + Number(f['acdn@1'] ?? 5);
+    const duration = Number(f['adur@1'] ?? 10);
+    if (u.drain) this.stopDrain(u);
+    u.drain = { target, until: this.time + duration, rate: Number(f['Ndr2@1'] ?? 10), range: Number(f['aare@1'] ?? 1000), ability: id };
+    const lightning = this.cat?.abilityFx?.[ab.base]?.lightning;
+    this.emit('link', { id: u.uid, from: u, to: target, lightning: lightning?.[2] ?? lightning?.[0] ?? 'DRAM', until: u.drain.until });
+    this.applyBuff(u, 'Bdcm', duration, {});
+    this.applyBuff(target, 'Bdtm', duration, {});
+    return null;
+  }
+
+  private updateDrain(u: Unit, dt: number) {
+    const d = u.drain!;
+    const t = d.target;
+    if (!t.alive || t.hidden || this.time >= d.until || Math.hypot(t.x - u.x, t.y - u.y) > d.range || u.stunUntil > this.time) return this.stopDrain(u);
+    const amount = Math.min(d.rate * dt, t.mana, u.maxMana - u.mana);
+    t.mana -= amount;
+    u.mana += amount;
+  }
+
+  private stopDrain(u: Unit) {
+    const d = u.drain;
+    if (!d) return;
+    u.drain = null;
+    this.removeBuff(u, 'Bdcm');
+    this.removeBuff(d.target, 'Bdtm');
+    this.emit('link', { id: u.uid, from: u, to: d.target, lightning: '', until: this.time });
+  }
+
+  /** ACmo (Skyfury, a Monsoon): lightning strikes in an area every Esf2 seconds for the duration. */
+  castStorm(u: Unit, id: string, x: number, y: number): string | null {
+    const ab = this.db.ability(id);
+    const f = ab.fields;
+    if ((u.abilityCd[id] ?? 0) > this.time) return ERR.cooldown;
+    if (Math.hypot(x - u.x, y - u.y) > Number(f['aran@1'] ?? 1000)) return ERR.notInRange;
+    const cost = Number(f['amcs@1'] ?? 0);
+    if (u.mana < cost) return ERR.noMana;
+    u.mana -= cost;
+    u.abilityCd[id] = this.time + Number(f['acdn@1'] ?? 10);
+    const duration = Number(f['adur@1'] ?? 20);
+    const effect = String(f['aeff@1'] ?? '');
+    const buff = String(f['abuf@1'] ?? '');
+    this.storms.push({ x, y, owner: u.owner, source: u, until: this.time + duration, next: this.time, interval: Math.max(0.1, Number(f['Esf2@1'] ?? 2)), damage: Number(f['Esf1@1'] ?? 50), radius: Number(f['aare@1'] ?? 250), buff });
+    const fx = this.cat?.buffs?.[effect];
+    if (fx?.effectArt[0]) this.emit('spellArt', { model: fx.effectArt[0], x, y, sound: fx.loopSound });
+    return null;
+  }
+
+  private stormStrike(s: Game['storms'][number]) {
+    s.next += s.interval;
+    const art = this.cat?.buffs?.[s.buff]?.targetArt[0] ?? '';
+    for (const c of this.units) {
+      if (!c.alive || c.owner !== CREEP_PLAYER || c.hidden || Math.hypot(c.x - s.x, c.y - s.y) > s.radius) continue;
+      if (c.def.abilities.includes('Amim')) continue;
+      if (art) this.emit('spellArt', { model: art, x: c.x, y: c.y, unit: c });
+      this.damage(c, s.damage, 'spells', s.source, false);
+    }
+  }
+
+  setAutocast(u: Unit, id: string, on: boolean) {
+    u.autocast[id] = on;
+  }
+
+  /** Deterministic random numbers (tests, replays) – mulberry32 instead of Math.random. */
+  seed(n: number) {
+    let a = n >>> 0;
+    this.rnd = () => {
+      a = (a + 0x6d2b79f5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  /** Click on a queued item in the info panel: removes it and refunds its cost (the first one restarts nothing). */
+  cancelQueued(u: Unit, index: number) {
+    const q = u.queue[index];
+    if (!q) return;
+    u.queue.splice(index, 1);
+    const p = this.players[u.owner];
+    if (p) p.gold += q.kind === 'train' ? this.db.unit(q.id).gold : this.db.upgrade(q.id).gold(q.level);
+  }
+
   /** A003 – Sell (Trig_Sell_Tower). */
   sell(tower: Unit) {
     if (!tower.alive || tower.constructing) return;
@@ -723,9 +1094,9 @@ export class Game {
     const def = this.db.unit(id);
     const p = this.players[building.owner];
     const missing = this.missingRequirements(building.owner, def);
-    if (missing.length) return `Requires: ${missing.join(', ')}`;
-    if (p.gold < def.gold) return 'Not enough gold.';
-    if (building.queue.length >= 7) return 'Queue is full.';
+    if (missing.length) return `${ERR.requires} ${missing.join(', ')}`;
+    if (p.gold < def.gold) return ERR.noGold;
+    if (building.queue.length >= 7) return ERR.queueFull;
     p.gold -= def.gold;
     building.queue.push({ kind: 'train', id, level: 0, total: Math.max(0.5, def.buildTime), elapsed: 0 });
     return null;
@@ -736,11 +1107,11 @@ export class Game {
     const p = this.players[building.owner];
     const queued = building.queue.filter((q) => q.id === id).length;
     const level = (p.research[id] ?? 0) + queued + 1;
-    if (level > up.levels) return 'Already researched.';
+    if (level > up.levels) return ERR.researched;
     const req = up.requires(level);
     const reqLevel = up.requiresLevel(level) || 1;
-    for (const r of req) if (/^R/.test(r) && (p.research[r] ?? 0) < reqLevel) return `Requires: ${this.db.upgrade(r).name(reqLevel)}`;
-    if (p.gold < up.gold(level)) return 'Not enough gold.';
+    for (const r of req) if (/^R/.test(r) && (p.research[r] ?? 0) < reqLevel) return `${ERR.requires} ${this.db.upgrade(r).name(reqLevel)}`;
+    if (p.gold < up.gold(level)) return ERR.noGold;
     p.gold -= up.gold(level);
     building.queue.push({ kind: 'research', id, level, total: Math.max(0.5, up.time(level)), elapsed: 0 });
     return null;
@@ -751,8 +1122,8 @@ export class Game {
     const def = this.db.unit(id);
     const stock = this.shopStock[id];
     const p = this.players[playerId];
-    if (!stock || stock.stock <= 0) return 'Out of stock.';
-    if (p.gold < def.gold) return 'Not enough gold.';
+    if (!stock || stock.stock <= 0) return ERR.outOfStock;
+    if (p.gold < def.gold) return ERR.noGold;
     p.gold -= def.gold;
     stock.stock--;
     if (stock.nextAt <= this.time) stock.nextAt = this.time + stock.regen;
@@ -778,6 +1149,7 @@ export class Game {
     builder.fly = builder.flying ? def.flyHeight || 200 : 0;
     builder.speed = def.speed;
     builder.path = null;
+    this.clearOrders(builder);
     this.emit('unitRemoved', builder);
     this.emit('unitAdded', builder);
   }
@@ -787,8 +1159,8 @@ export class Game {
     const ab = this.db.ability(this.cfg.coinBasherAbility);
     const range = Number(ab.fields['aran@1'] ?? 1000);
     const cd = Number(ab.fields['acdn@1'] ?? 8);
-    if ((builder.abilityCd[ab.id] ?? 0) > this.time) return 'Ability is on cooldown.';
-    if (Math.hypot(target.x - builder.x, target.y - builder.y) > range) return 'Target is out of range.';
+    if ((builder.abilityCd[ab.id] ?? 0) > this.time) return ERR.cooldown;
+    if (Math.hypot(target.x - builder.x, target.y - builder.y) > range) return ERR.notInRange;
     const p = this.players[builder.owner];
     if (p.gold < this.wave) {
       this.emit('floatText', { text: this.str('TRIGSTR_751'), x: builder.x, y: builder.y, color: '#ffffff', lifespan: 3 });
@@ -800,10 +1172,25 @@ export class Game {
     const m = this.launch(builder, target, 0, 1000, 0.15, 0xffd040, String(ab.fields.amat ?? ''), true);
     m.homing = true;
     m.stun = Number(ab.fields['adur@1'] ?? 5);
+    m.stunHero = Number(ab.fields['ahdu@1'] ?? m.stun);
     return null;
   }
 
   orderMove(u: Unit, x: number, y: number) {
+    this.clearOrders(u);
+    u.holdPosition = false;
+    u.chase = null;
+    u.forcedTarget = null;
+    this.moveTo(u, x, y);
+  }
+
+  /** Hold Position (H): stop and do not chase enemies. */
+  hold(u: Unit) {
+    this.stop(u);
+    u.holdPosition = true;
+  }
+
+  private moveTo(u: Unit, x: number, y: number) {
     u.moveTarget = { x, y };
     u.attackGate = false;
     const straight = u.flying || u.def.moveType === '' || u.kind === 'creep';
@@ -811,10 +1198,15 @@ export class Game {
   }
 
   orderAttack(u: Unit, target: Unit) {
-    if (u.def.attack) u.forcedTarget = target;
+    if (!u.def.attack) return;
+    u.forcedTarget = target;
+    u.holdPosition = false;
   }
 
   stop(u: Unit) {
+    this.clearOrders(u);
+    u.chase = null;
+    u.holdPosition = false;
     u.moveTarget = null;
     u.path = null;
     u.forcedTarget = null;
@@ -852,12 +1244,15 @@ export class Game {
       if (!u.alive) continue;
       u.animTime += dt;
       if (u.constructing) {
+        // Progress only while a builder works on it (Human construction).
+        if (!this.units.some((b) => b.constructs === u && b.alive && b.anim === 'work')) continue;
         u.constructing.elapsed += dt;
         u.hp = Math.min(u.maxHp, u.maxHp * (0.1 + 0.9 * (u.constructing.elapsed / u.constructing.total)));
         if (u.constructing.elapsed >= u.constructing.total) {
           u.constructing = null;
           u.anim = 'stand';
           this.emit('completed', u);
+          this.emit('constructed', u);
         }
         continue;
       }
@@ -873,10 +1268,13 @@ export class Game {
           this.emit('unitRemoved', u);
           this.emit('unitAdded', u);
           this.emit('completed', u);
+          this.emit('upgraded', u);
         }
         continue;
       }
       if (u.queue.length) this.processQueue(u, dt);
+      if (u.maxMana > 0) u.mana = Math.min(u.maxMana, u.mana + u.manaRegen * dt);
+      for (const [id, b] of Object.entries(u.buffs)) if (b.until <= this.time) this.removeBuff(u, id);
       if (u.poison && u.poison.until > this.time) this.damage(u, u.poison.dps * dt, 'spells', u.poison.source, true);
       else u.poison = null;
       if (!u.alive) continue;
@@ -885,6 +1283,8 @@ export class Game {
 
       if (u.kind === 'creep') this.updateCreep(u, dt);
       else if (u.speed > 0 && u.path) this.moveAlong(u, dt);
+      if (u.kind === 'builder') this.updateBuilder(u);
+      this.updateSpells(u, dt);
 
       if (u.def.attack && u.kind !== 'creep' && !u.hidden) this.updateAttacker(u, dt, detectors, auras);
     }
@@ -918,16 +1318,19 @@ export class Game {
       const angle = this.rnd() * Math.PI * 2;
       const nu = this.createUnit(q.id, u.owner, u.x + Math.cos(angle) * 220, u.y + Math.sin(angle) * 220, angle);
       nu.anim = 'birth';
+      this.emit('trained', nu);
     } else {
       const p = this.players[u.owner];
       p.research[q.id] = Math.max(p.research[q.id] ?? 0, q.level);
-      this.message(`Research complete: ${this.db.upgrade(q.id).name(q.level)}`, 5);
+      this.message(`|cffffcc00Výzkum dokončen: ${this.db.upgrade(q.id).name(q.level)}|r`, 5);
+      this.emit('researched', { owner: u.owner, id: q.id, level: q.level });
     }
   }
 
   private effectiveSpeed(u: Unit) {
     let s = u.speed;
     if (u.slow) s *= 1 - u.slow.move;
+    s *= 1 + this.buffSum(u, 'move');
     const min = Number(this.map.info.misc?.Misc?.MinUnitSpeed ?? 0);
     return u.speed > 0 ? Math.max(Math.min(min, u.speed), s) : 0;
   }
@@ -950,8 +1353,10 @@ export class Game {
       u.cooldown -= dt;
       if (u.cooldown <= 0 && u.def.attack) {
         const a = u.def.attack;
-        u.cooldown = a.cooldown * (u.slow ? 1 + u.slow.attack : 1);
+        u.cooldown = (a.cooldown * (u.slow ? 1 + u.slow.attack : 1)) / (1 + this.buffSum(u, 'attack'));
         u.animTime = 0;
+        const weaponSound = String(u.def.fields.ucs1 ?? '');
+        if (weaponSound) this.emit('combatHit', { weaponSound, armor: this.db.doodadModel(gate.id)?.armor ?? 'Stone', x: gate.x, y: gate.y });
         if (!gate.invulnerable) {
           gate.hp -= rollDamage(a.damageBase, a.dice, a.sides, this.rnd);
           if (gate.hp <= 0) {
@@ -1060,6 +1465,46 @@ export class Game {
         }
       }
     }
+    // Mobile units (temple defenders) walk to targets like the engine: an ordered target is followed, otherwise
+    // enemies within the acquisition range (uacq) are engaged – unless the unit holds its position or is moving.
+    if (u.speed > 0 && u.kind === 'defender') {
+      if (t) {
+        if (u.chase) {
+          u.chase = null;
+          u.path = null;
+          u.moveTarget = null;
+        }
+      } else {
+        const valid = (c: Unit | null) => !!c && c.alive && this.canTarget(u, c, detectors);
+        let c: Unit | null = valid(u.forcedTarget) ? u.forcedTarget : null;
+        if (!c && valid(u.chase) && Math.hypot(u.chase!.x - u.x, u.chase!.y - u.y) <= a.acquire * 1.25) c = u.chase;
+        if (!c && !u.holdPosition && (!u.moveTarget || u.chase)) {
+          let best = a.acquire;
+          for (const e of this.units) {
+            if (e.owner !== CREEP_PLAYER || !this.canTarget(u, e, detectors)) continue;
+            const d = Math.hypot(e.x - u.x, e.y - u.y);
+            if (d <= best) {
+              best = d;
+              c = e;
+            }
+          }
+        }
+        if (c) {
+          if (u.chase !== c || this.time >= u.chaseRepath || !u.path) {
+            this.moveTo(u, c.x, c.y);
+            u.chaseRepath = this.time + 0.5;
+          }
+          u.chase = c;
+          u.target = null;
+          return;
+        }
+        if (u.chase) {
+          u.chase = null;
+          u.path = null;
+          u.moveTarget = null;
+        }
+      }
+    }
     u.target = t;
     if (!t) {
       if (u.anim === 'attack' && u.animTime > 0.6) u.anim = 'stand';
@@ -1068,7 +1513,7 @@ export class Game {
     u.facing = Math.atan2(t.y - u.y, t.x - u.x);
     if (u.cooldown > 0) return;
     const speedBonus = this.auraBonus(u, auras, 'AOae');
-    u.cooldown = a.cooldown / (1 + speedBonus);
+    u.cooldown = a.cooldown / (1 + speedBonus + this.buffSum(u, 'attack'));
     u.anim = 'attack';
     u.animTime = 0;
     // The missile leaves / damage lands at the attack's damage point (udp1), not at the start of the swing.
@@ -1098,7 +1543,7 @@ export class Game {
     const detectors = this.detectors();
 
     let dmg = rollDamage(a.damageBase, a.dice, a.sides, this.rnd);
-    dmg *= 1 + this.auraBonus(u, auras, 'ACac');
+    dmg *= 1 + this.auraBonus(u, auras, 'ACac') + this.buffSum(u, 'damage');
     if (u.kind === 'defender') {
       const lvl = this.players[u.owner]?.research.R002 ?? 0;
       if (lvl > 0) {
@@ -1112,7 +1557,7 @@ export class Game {
     }
     const color = u.def.attack ? attackColor(a.attackType) : 0xffffff;
     if (a.missileSpeed <= 0 || a.weaponType === 'instant' || a.weaponType === 'normal') {
-      if (a.missileSpeed <= 0 || a.weaponType === 'instant') this.emit('lightning', { from: u, to: t, color });
+      if (a.missileSpeed <= 0 || a.weaponType === 'instant') this.emit('lightning', { from: u, to: t, color, model: a.missile });
       this.hit(u, t, t.x, t.y, dmg, null);
     } else {
       const m = this.launch(u, t, dmg, a.missileSpeed, a.missileArc, color, a.missile, false);
@@ -1207,7 +1652,7 @@ export class Game {
 
   private impact(m: Missile) {
     if (m.stun && m.target?.alive) {
-      m.target.stunUntil = this.time + m.stun;
+      m.target.stunUntil = this.time + (this.resistant(m.target) ? Math.min(m.stun, m.stunHero || m.stun) : m.stun);
       this.emit('effect', { model: 'Abilities\\Spells\\Other\\Transmute\\PileofGold.mdl', x: m.x, y: m.y, color: 0xffd040 });
       return;
     }
@@ -1255,7 +1700,7 @@ export class Game {
     if (primary) {
       const ev = t.def.abilities.includes('ACev') ? Number(this.db.ability('ACev').fields['Eev1@1'] ?? 0.1) : 0;
       if (ev > 0 && this.rnd() < ev) {
-        this.emit('floatText', { text: 'miss', x: t.x, y: t.y, color: '#ff4040', lifespan: 1.5 });
+        this.emit('floatText', { text: ERR.miss, x: t.x, y: t.y, color: '#ff4040', lifespan: 1.5 });
         return;
       }
       const immune = t.def.abilities.includes('Amim');
@@ -1264,10 +1709,12 @@ export class Game {
         const f = ab.fields;
         if (ab.base === 'ACbh' && this.rnd() * 100 < Number(f['Hbh1@1'] ?? 0)) {
           damage += Number(f['Hbh3@1'] ?? 0);
-          t.stunUntil = Math.max(t.stunUntil, this.time + Number(f['adur@1'] ?? 1));
+          t.stunUntil = Math.max(t.stunUntil, this.time + this.spellDuration(t, f, 1));
         }
         if (ab.base === 'Aspo' && !immune) {
-          const dur = Number(f['adur@1'] ?? 3);
+          const dur = this.spellDuration(t, f, 3);
+          const buff = String(f['abuf@1'] ?? '').split(',')[0];
+          if (buff) this.applyBuff(t, buff, dur, {});
           const move = Number(f['Spo2@1'] ?? 0);
           const atk = Number(f['Spo3@1'] ?? 0);
           if (move > 0 || atk > 0) t.slow = { move: Math.max(t.slow?.move ?? 0, move), attack: Math.max(t.slow?.attack ?? 0, atk), until: this.time + dur };
@@ -1283,6 +1730,7 @@ export class Game {
   private damage(t: Unit, amount: number, _type: string, src: Unit | null, periodic: boolean) {
     if (!t.alive || t.phaseUntil > this.time) return;
     t.hp -= amount;
+    t.lastDamaged = this.time;
     if (!periodic && t.def.abilities.includes('Apsh') && t.phaseReady <= this.time && t.hp > 0) {
       const ab = this.db.ability('Apsh');
       t.phaseUntil = this.time + Number(ab.fields['adur@1'] ?? 1);
@@ -1314,6 +1762,7 @@ export class Game {
       }
       if (gold > 0) {
         p.gold += gold;
+        p.earned += gold;
         this.emit('floatText', { text: `+${gold}`, x: t.x, y: t.y, color: '#ffdc00', lifespan: 3 });
       }
     }

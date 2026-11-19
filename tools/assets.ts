@@ -357,14 +357,16 @@ async function main() {
       fixedRotation: r.fixedrot !== undefined ? Number(r.fixedrot) : undefined,
       texId: r.texid && r.texid !== '_' ? Number(r.texid) : undefined,
       texFile: r.texfile && r.texfile !== '_' ? r.texfile.replace(/\.(blp|dds|tga)$/i, '') : undefined,
+      armor: r.armor && r.armor !== '_' ? r.armor : undefined,
     };
   }
 
   // --- files to copy -----------------------------------------------------------------------------
-  const wanted = new Set<string>();
+  // Models enqueue their textures and event-object resources while being copied, so this is a work queue.
+  const queue: string[] = [];
   const want = (p: string | number | undefined | null) => {
     if (typeof p !== 'string' || !p.trim()) return;
-    wanted.add(p.trim());
+    queue.push(p.trim());
   };
   const wantModel = (p: string | number | undefined | null) => {
     if (typeof p !== 'string' || !p.trim()) return;
@@ -432,6 +434,9 @@ async function main() {
   want('Abilities\\Spells\\Human\\MassTeleport\\MassTeleportTarget.mdx');
   // Order confirmations (UI\\war3skins.txt: TargetPointConfirm / TargetUnitConfirm).
   want('UI\\Feedback\\Confirmation\\Confirmation.mdx');
+  for (const p of ['Background', 'Fill', 'Glass', 'Glow']) want(`Textures\\Loading-Bar${p}.blp`);
+  // Build queue and progress bar of the info panel (UI\war3skins.txt BuildQueueBackdrop, SimpleBuildTimeIndicator…).
+  for (const p of ['UI\\Widgets\\Console\\Human\\human-unitqueue-border.blp', 'UI\\Feedback\\BuildProgressBar\\human-buildprogressbar-fill.blp', 'UI\\Feedback\\BuildProgressBar\\human-buildprogressbar-border.blp']) want(p);
   want('UI\\Feedback\\Target\\Target.mdx');
   want('Abilities\\Spells\\Other\\Transmute\\PileofGold.mdx');
   want('Objects\\StartLocation\\StartLocation.mdx');
@@ -445,13 +450,189 @@ async function main() {
   catalog.music = playlist.split(';').map((s) => s.trim()).filter(Boolean);
   for (const m of catalog.music) want(m);
 
+  // --- sounds and model event objects -------------------------------------------------------------
+  // Keys of these tables may carry trailing spaces in the SLKs ("OBKB "), event names too ("SNDXAHSL ").
+  const trimmed = (t: Map<string, Row>) => new Map([...t].map(([k, v]) => [k.trim(), v]));
+  const soundTables = ['AnimSounds', 'UnitAckSounds', 'UnitCombatSounds', 'UISounds', 'AbilitySounds'].map((t) => trimmed(slk(`UI\\SoundInfo\\${t}.slk`)));
+  const animLookups = trimmed(slk('UI\\SoundInfo\\AnimLookups.slk'));
+  const splatData = trimmed(slk('Splats\\SplatData.slk'));
+  const uberSplatData = trimmed(slk('Splats\\UberSplatData.slk'));
+  const spawnData = trimmed(slk('Splats\\SpawnData.slk'));
+  // Lightning effects (instant attacks): Splats\LightningData.slk.
+  catalog.lightnings = {};
+  for (const [id, r] of trimmed(slk('Splats\\LightningData.slk'))) {
+    if (!['CHIM', 'CLPB', 'CLSB', 'FORK', 'DRAB', 'DRAL', 'DRAM'].includes(id)) continue;
+    const texture = `${r.dir}\\${(r.file ?? '').replace(/\.blp$/i, '')}`;
+    catalog.lightnings[id] = {
+      texture,
+      avgSegLen: Number(r.avgseglen ?? 100),
+      width: Number(r.width ?? 40),
+      color: ['r', 'g', 'b', 'a'].map((k) => Number(r[k] ?? 255)),
+      noiseScale: Number(r.noisescale ?? 0.05),
+      texCoordScale: Number(r.texcoordscale ?? 0.5),
+      duration: Number(r.duration ?? 2),
+    };
+    want(`${texture}.blp`);
+  }
+  catalog.sounds = {};
+  catalog.eventSounds = {};
+  catalog.splats = {};
+  catalog.uberSplats = {};
+  catalog.spawns = {};
+  const num = (r: Row, k: string) => Number(r[k.toLowerCase()] ?? 0) || 0;
+  const rgba = (r: Row, p: string) => ['R', 'G', 'B', 'A'].map((c) => num(r, `${p}${c}`));
+  /** Registers a sound label (and its files) in the catalog; false when no table knows it. */
+  const addSound = (label: string | undefined): boolean => {
+    if (!label || label === 'NULL' || label === '_') return false;
+    if (catalog.sounds![label]) return true;
+    const row = soundTables.map((t) => t.get(label)).find(Boolean);
+    if (!row) return false;
+    const files = (row.filenames ?? '').split(',').map((s) => s.trim()).filter(Boolean).map((f) => `${row.directorybase ?? ''}${f}`);
+    if (!files.length) return false;
+    catalog.sounds![label] = {
+      files,
+      volume: num(row, 'Volume'),
+      pitch: num(row, 'Pitch') || 1,
+      pitchVariance: num(row, 'PitchVariance'),
+      minDistance: num(row, 'MinDistance'),
+      maxDistance: num(row, 'MaxDistance'),
+      distanceCutoff: num(row, 'DistanceCutoff'),
+      channel: num(row, 'Channel'),
+      flags: row.flags ?? '',
+    };
+    for (const f of files) want(f);
+    return true;
+  };
+  const addUberSplat = (id: string) => {
+    const r = uberSplatData.get(id);
+    if (!r || catalog.uberSplats![id]) return;
+    const texture = `${r.dir}\\${r.file}`;
+    catalog.uberSplats![id] = {
+      texture,
+      blendMode: num(r, 'BlendMode'),
+      scale: num(r, 'Scale'),
+      birthTime: num(r, 'BirthTime'),
+      pauseTime: num(r, 'PauseTime'),
+      decay: num(r, 'Decay'),
+      colors: [rgba(r, 'Start'), rgba(r, 'Middle'), rgba(r, 'End')],
+      sound: addSound(r.sound) ? r.sound : undefined,
+    };
+    want(`${texture}.blp`);
+  };
+  /** Event object of a model: SND (sound), SPL/FPT (splat, footprint), UBR (ubersplat), SPN (spawned model). */
+  const addEventObject = (name: string) => {
+    const type = name.slice(0, 3).toUpperCase();
+    const id = name.slice(4, 8).trim();
+    if (type === 'SND') {
+      const label = animLookups.get(id)?.soundlabel;
+      if (label && addSound(label)) catalog.eventSounds![id] = label;
+    } else if (type === 'SPL' || type === 'FPT') {
+      const r = splatData.get(id);
+      if (!r || catalog.splats![id]) return;
+      const texture = `${r.dir}\\${r.file}`;
+      catalog.splats![id] = {
+        texture,
+        rows: num(r, 'Rows') || 1,
+        columns: num(r, 'Columns') || 1,
+        blendMode: num(r, 'BlendMode'),
+        scale: num(r, 'Scale'),
+        lifespan: num(r, 'Lifespan'),
+        decay: num(r, 'Decay'),
+        uvLifespan: [num(r, 'UVLifespanStart'), num(r, 'UVLifespanEnd'), num(r, 'LifespanRepeat')],
+        uvDecay: [num(r, 'UVDecayStart'), num(r, 'UVDecayEnd'), num(r, 'DecayRepeat')],
+        colors: [rgba(r, 'Start'), rgba(r, 'Middle'), rgba(r, 'End')],
+        sound: addSound(r.sound) ? r.sound : undefined,
+      };
+      want(`${texture}.blp`);
+    } else if (type === 'UBR') {
+      addUberSplat(id);
+    } else if (type === 'SPN') {
+      const model = spawnData.get(id)?.model;
+      if (!model || catalog.spawns![id]) return;
+      catalog.spawns![id] = model.replace(/\.md[lx]$/i, '');
+      wantModel(model);
+    }
+  };
+  // Buffs / effects of the abilities in use (profile [Bxxx] Targetart / Targetattach…, Effectart, sounds).
+  catalog.buffs = {};
+  const buffIds = new Set<string>();
+  const abilityFieldSets = [...Object.values(catalog.abilities), ...Object.values(w3a).map((o) => o.fields)];
+  for (const f of abilityFieldSets) for (const [k, v] of Object.entries(f)) if (/^(abuf|aeff)@/.test(k) && typeof v === 'string') for (const b of v.split(',')) if (b.trim()) buffIds.add(b.trim());
+  for (const id of buffIds) {
+    const p = profile.get(id);
+    if (!p) continue;
+    const list = (v: string | undefined) => (v ? splitList(v).map((s) => s.trim()).filter(Boolean) : []);
+    const attach = (prefix: string, n: number) => Array.from({ length: Math.max(1, n) }, (_, i) => p[`${prefix}attach${i || ''}`] ?? '');
+    const targetArt = list(p.targetart);
+    catalog.buffs[id] = {
+      targetArt,
+      targetAttach: attach('target', Number(p.targetattachcount ?? targetArt.length) || targetArt.length),
+      effectArt: list(p.effectart),
+      specialArt: list(p.specialart),
+      effectSound: addSound(p.effectsound) ? p.effectsound : undefined,
+      loopSound: addSound(p.effectsoundlooped) ? p.effectsoundlooped : undefined,
+    };
+    for (const m of [...targetArt, ...list(p.effectart), ...list(p.specialart)]) wantModel(m);
+  }
+  // Ability effect sounds / lightning (profile Effectsound, Effectsoundlooped, LightningEffect).
+  catalog.abilityFx = {};
+  for (const base of new Set(Object.values(w3a).map((o) => o.base))) {
+    const p = profile.get(base);
+    if (!p) continue;
+    const fx = {
+      effectSound: addSound(p.effectsound) ? p.effectsound : undefined,
+      loopSound: addSound(p.effectsoundlooped) ? p.effectsoundlooped : undefined,
+      lightning: p.lightningeffect ? splitList(p.lightningeffect).map((s) => s.trim()).filter(Boolean) : undefined,
+    };
+    if (fx.effectSound || fx.loopSound || fx.lightning) catalog.abilityFx[base] = fx;
+  }
+
+  // Per unit type: acknowledgements (unit field "usnd"), weapon impact sounds ("ucs1" × target armour),
+  // blob shadow ("ushu") and the ubersplat under buildings ("uubs").
+  const armorSounds = ['Flesh', 'Metal', 'Wood', 'Stone', 'Ethereal'];
+  for (const o of Object.values(map.objects.w3u ?? {})) {
+    const f = { ...catalog.units[o.base], ...o.fields };
+    const s = (k: string) => (typeof f[k] === 'string' ? String(f[k]).trim() : '');
+    if (s('usnd')) for (const k of ['What', 'Yes', 'YesAttack', 'Ready', 'Pissed', 'Warcry']) addSound(`${s('usnd')}${k}`);
+    if (s('ucs1')) for (const a of armorSounds) addSound(`${s('ucs1')}${a}`);
+    if (s('ushu')) want(`ReplaceableTextures\\Shadows\\${s('ushu')}.blp`);
+    if (s('uubs')) addUberSplat(s('uubs'));
+  }
+  want('ReplaceableTextures\\Shadows\\ShadowFlyer.blp');
+  // Interface sounds of the local player's race (UI\SoundInfo\UISounds.slk).
+  for (const label of ['InterfaceClick', 'InterfaceError', 'MenuButtonClick', 'AutoCastButtonClick', 'PauseGame', 'MapPing', 'Warning', 'Hint', 'QuestNew', 'QuestUpdate', 'QuestLogModified', 'PlaceBuildingDefault', 'ConstructingBuildingDefault', `JobDoneSound${race}`, `UpgradeComplete${race}`, `ResearchComplete${race}`, `NoGold${race}`, `CantPlace${race}`]) addSound(label);
+  // Cursor (UI\war3skins.txt [<race>] Cursor) and selection circles / shadow colour (UI\MiscData.txt).
+  const misc = new Map<string, Row>();
+  parseIni(A.text('UI\\MiscData.txt'), misc);
+  const sc = misc.get('SelectionCircle') ?? {};
+  const color = (v: string | undefined, fb: number[]) => (v ? v.split(',').map(Number) : fb);
+  const circles = Array.from({ length: Number(sc.numsizes ?? 3) }, (_, i) => {
+    const k = String(i).padStart(2, '0');
+    return { maxSize: Number(sc[`size${k}`] ?? Infinity), texture: sc[`texture${k}`] ?? '' };
+  }).filter((c) => c.texture);
+  for (const c of circles) want(`${c.texture}.blp`);
+  const cursor = skins.get(race)?.cursor ?? skins.get('Default')?.cursor ?? 'UI\\Cursor\\HumanCursor.mdl';
+  wantModel(cursor);
+  // Day/night lighting models: the engine picks them by tileset (SetDayNightModels); most tilesets use Lordaeron.
+  const dncName = ({ A: 'Ashenvale', C: 'Felwood', D: 'Dungeon', G: 'Underground', X: 'Dalaran', J: 'Dalaran' } as Record<string, string>)[map.terrain.tileset] ?? 'Lordaeron';
+  const dnc = (kind: string) => `Environment\\DNC\\DNC${dncName}\\DNC${dncName}${kind}\\DNC${dncName}${kind}`;
+  wantModel(dnc('Terrain'));
+  wantModel(dnc('Unit'));
+  catalog.ui = {
+    cursor: cursor.replace(/\.md[lx]$/i, ''),
+    dnc: { terrain: dnc('Terrain'), unit: dnc('Unit') },
+    selectionCircles: circles.map((c) => ({ ...c, maxSize: Number.isFinite(c.maxSize) ? c.maxSize : 1e9 })),
+    selectionScale: Number(sc.scalefactor ?? 72),
+    selectionColors: { friend: color(sc.colorfriend, [255, 0, 255, 0]), neutral: color(sc.colorneutral, [255, 255, 255, 0]), enemy: color(sc.colorenemy, [255, 255, 0, 0]) },
+    shadowColor: color([...misc.values()].find((r) => r.shadowimagecolor)?.shadowimagecolor, [170, 0, 0, 0]),
+  };
+
   // --- copy (models pull in their textures) ------------------------------------------------------
   // Textures: original BLP is copied as-is; DDS (Reforged / HD mods) is decoded and stored as PNG.
   const out = 'public/war3';
   const copied = new Set<string>();
   const done = new Set<string>();
   const missing: string[] = [];
-  const queue = [...wanted];
   const optional = (p: string) => /\.(flac|mp3)$/i.test(p) || /\.wav$/i.test(p) || /Terrain\\(City)?Cliffs\\/i.test(p) || /\d\.mdx$/i.test(p) || /_portrait\.mdx$/i.test(p);
   const write = (key: string, bytes: Uint8Array) => {
     copied.add(key);
@@ -500,6 +681,7 @@ async function main() {
         const model = new parsers.mdlx.Model();
         model.load(new Uint8Array(bytes).slice().buffer);
         for (const t of model.textures) if (t.path) queue.push(t.path);
+        for (const e of model.eventObjects) addEventObject(e.name);
       } catch (e) {
         console.warn(`  could not parse ${p}: ${e}`);
       }

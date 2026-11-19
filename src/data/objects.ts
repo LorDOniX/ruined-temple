@@ -284,11 +284,11 @@ export class ObjectDB {
     return str(f?.dnam ?? f?.bnam ?? this.catalog?.doodads[id]?.name, id);
   }
 
-  doodadModel(id: string): { file: string; numVar: number; texId?: number; texFile?: string } | null {
+  doodadModel(id: string): { file: string; numVar: number; texId?: number; texFile?: string; armor?: string } | null {
     const custom = this.map.objects.w3d?.[id]?.fields?.dfil ?? this.map.objects.w3b?.[id]?.fields?.bfil;
     if (custom) return { file: str(custom).replace(/\.md[lx]$/i, ''), numVar: 1 };
     const c = this.catalog?.doodads[id];
-    return c ? { file: c.file.replace(/\.md[lx]$/i, ''), numVar: c.numVar, texId: c.texId, texFile: c.texFile } : null;
+    return c ? { file: c.file.replace(/\.md[lx]$/i, ''), numVar: c.numVar, texId: c.texId, texFile: c.texFile, armor: c.armor } : null;
   }
 
   destructableLife(id: string) {
