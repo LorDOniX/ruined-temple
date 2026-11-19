@@ -9,6 +9,8 @@ import { WorldView } from './render/world';
 import { Wc3Assets } from './render/mdx';
 import { CREEP_PLAYER, Game, type Unit } from './game/game';
 import { Hud } from './ui/hud';
+import { PortraitView } from './render/portrait';
+import { plainText } from './data/objects';
 import { SoundPlayer } from './sound';
 
 async function loadJson<T>(url: string): Promise<T | null> {
@@ -96,6 +98,7 @@ async function main() {
   }
 
   const hud = new Hud(game, map, 0, assets);
+  const portrait = new PortraitView(assets);
   const p = hud.playable;
   terrain.material.uniforms.uPlayable.value.set(p.minX, p.minY, p.maxX, p.maxY);
 
@@ -119,8 +122,15 @@ async function main() {
   if (catalog?.music) sound.startMusic(catalog.music);
   const musicBtn = document.getElementById('btn-music')!;
   musicBtn.hidden = !sound.hasMusic;
-  musicBtn.classList.toggle('on', sound.musicOn);
-  musicBtn.addEventListener('click', () => musicBtn.classList.toggle('on', sound.toggleMusic()));
+  const musicLabel = () => {
+    musicBtn.classList.toggle('on', sound.musicOn);
+    musicBtn.textContent = `Hudba: ${sound.musicOn ? 'zapnuta' : 'vypnuta'}`;
+  };
+  musicLabel();
+  musicBtn.addEventListener('click', () => {
+    sound.toggleMusic();
+    musicLabel();
+  });
 
   stage('Rozmisťuji doodady a jednotky…');
   await view.buildStatic();
@@ -171,6 +181,10 @@ async function main() {
   document.getElementById('btn-pathing')!.addEventListener('click', togglePathing);
   document.getElementById('btn-regions')!.addEventListener('click', toggleRegions);
   addEventListener('keydown', (e) => {
+    if (e.key === 'Alt') {
+      e.preventDefault();
+      view.showAllHp = true;
+    }
     if (e.key === 'F2') {
       e.preventDefault();
       toggleRegions();
@@ -180,6 +194,11 @@ async function main() {
       togglePathing();
     }
   });
+
+  addEventListener('keyup', (e) => {
+    if (e.key === 'Alt') view.showAllHp = false;
+  });
+  addEventListener('blur', () => (view.showAllHp = false));
 
   // --- mouse --------------------------------------------------------------------------------------------
   const raycaster = new THREE.Raycaster();
@@ -198,8 +217,14 @@ async function main() {
   // Drag selection box (left button), WC3 style: units preferred over structures, Shift adds/removes.
   const dragBox = document.getElementById('drag-box')!;
   let drag: { x: number; y: number; cx: number; cy: number; active: boolean } | null = null;
+  // Mouse-over label: owner name in the player's colour (the creep player is shown red like in the game).
+  const creepName = map.info.players.find((p) => p.id === CREEP_PLAYER)?.name ?? 'Creeps';
+  const ownerName = (u: Unit) =>
+    u.owner === CREEP_PLAYER ? { name: creepName, color: '#ff0303' } : u.owner < game.players.length ? { name: game.players[u.owner].name, color: game.players[u.owner].color } : { name: plainText(u.def.name), color: '#ffffff' };
+  canvas.addEventListener('mouseleave', () => view.setHover(null, ownerName));
   canvas.addEventListener('mousemove', (e) => {
     const [mx, my] = mousePos(e);
+    view.setHover(drag?.active ? null : view.pick(mx, my, cam.camera, canvas.clientWidth, canvas.clientHeight), ownerName);
     if (drag) {
       drag.cx = mx;
       drag.cy = my;
@@ -277,7 +302,16 @@ async function main() {
           else hud.report('Must target a creep.');
         } else if (hud.mode.ability === 'move') {
           const pt = groundPoint(mx, my);
-          if (pt) groupMove(group, pt.x, pt.y);
+          if (pt && groupMove(group, pt.x, pt.y)) view.orderConfirmation(pt.x, pt.y);
+        } else if (hud.mode.ability === 'attack') {
+          const own = group.filter((u) => u.alive && u.owner === hud.localPlayer);
+          if (target && target.owner === CREEP_PLAYER && own.some((u) => u.def.attack)) {
+            for (const u of own) if (u.def.attack) game.orderAttack(u, target);
+            view.orderConfirmation(target.x, target.y, 'attack', true);
+          } else {
+            const pt = groundPoint(mx, my);
+            if (pt && groupMove(own, pt.x, pt.y)) view.orderConfirmation(pt.x, pt.y, 'attack');
+          }
         }
         hud.mode = { kind: 'normal' };
         return;
@@ -294,10 +328,10 @@ async function main() {
       const target = view.pick(mx, my, cam.camera, canvas.clientWidth, canvas.clientHeight);
       if (target && target.owner === CREEP_PLAYER && own.some((u) => u.def.attack)) {
         for (const u of own) if (u.def.attack) game.orderAttack(u, target);
-        view.floatText('!', target.x, target.y, '#ff4040', 0.6);
+        view.orderConfirmation(target.x, target.y, 'attack', true);
       } else {
         const pt = groundPoint(mx, my);
-        if (pt && groupMove(own, pt.x, pt.y)) view.floatText('•', pt.x, pt.y, '#40ff40', 0.5);
+        if (pt && groupMove(own, pt.x, pt.y)) view.orderConfirmation(pt.x, pt.y);
       }
     }
   });
@@ -326,12 +360,15 @@ async function main() {
     if (hud.mode.kind !== 'build') view.showGhost(null);
     view.update(dt, cam.camera, canvas.clientWidth, canvas.clientHeight);
     hud.update(selected);
+    portrait.setUnit(selected && (selected.alive || selected.owner === CREEP_PLAYER) ? selected : null);
+    portrait.update(game.paused ? 0 : dt);
     hud.drawMinimap(frustumCorners());
     if (pathingOn && (pathingTimer += dt) > 0.5) {
       pathingTimer = 0;
       refreshPathing();
     }
     renderer.render(scene, cam.camera);
+    portrait.render(renderer, hud.portraitRect(), canvas.clientHeight);
   };
   const loop = (now: number) => {
     const dt = Math.min(0.1, (now - last) / 1000);
@@ -342,7 +379,7 @@ async function main() {
   requestAnimationFrame(loop);
 
   // Handy for debugging from the console (frame() advances one tick even when the tab is hidden).
-  Object.assign(window as object, { game, view, cam, db, map, hud, frame });
+  Object.assign(window as object, { game, view, cam, db, map, hud, frame, portrait });
 }
 
 main().catch((e) => {

@@ -237,6 +237,47 @@ export class Wc3Assets {
       return geosetAlpha >= 0.01 && evalTrack(m.layer, 'KMTA', m.layer.alpha, iv, globals) >= 0.01;
     };
     for (const m of meshes) m.mesh.visible = m.mesh.userData.standVisible = visibleIn(m, interval);
+    // Moment (seconds into the stand sequence) when every geoset has faded out – lifetime of one-shot effect models.
+    let fadeAt = (interval[1] - interval[0]) / 1000;
+    const fades = meshes.map((m) => {
+      const a = ga(m.geoset)?.animations?.find((x: any) => x.name === 'KGAO');
+      if (!a) return Infinity;
+      for (let i = 0; i < a.frames.length; i++) if (a.frames[i] > interval[0] && a.frames[i] <= interval[1] && a.values[i][0] < 0.01) return (a.frames[i] - interval[0]) / 1000;
+      return Infinity;
+    });
+    if (fades.length && fades.every(Number.isFinite)) fadeAt = Math.min(fadeAt, Math.max(...fades));
+    group.userData.lifetime = fadeAt;
+
+    // Particle emitters (type 2) – simulated by ParticleSystem (particles.ts) on the cloned bones.
+    const emitters2: Emitter2Def[] = [];
+    for (const e of (model.particleEmitters2 as any[]) ?? []) {
+      if (!(e.objectId >= 0) || !boneIndex.has(e.objectId)) continue;
+      const tex = e.replaceableId ? null : textures[e.textureId] ?? null;
+      emitters2.push({
+        node: `n${e.objectId}`,
+        raw: e,
+        texture: tex,
+        filterMode: e.filterMode,
+        rows: Math.max(1, e.rows),
+        columns: Math.max(1, e.columns),
+        head: e.headOrTail === 0 || e.headOrTail === 2,
+        tail: e.headOrTail === 1 || e.headOrTail === 2,
+        tailLength: e.tailLength,
+        timeMiddle: Math.min(0.999, Math.max(0.001, e.timeMiddle)),
+        colors: [0, 1, 2].map((i) => [e.segmentColors[i][0], e.segmentColors[i][1], e.segmentColors[i][2], e.segmentAlphas[i] / 255]),
+        scaling: [e.segmentScaling[0], e.segmentScaling[1], e.segmentScaling[2]],
+        intervals: [e.headIntervals[0], e.headIntervals[1], e.tailIntervals[0], e.tailIntervals[1]].map((v: Uint32Array) => [v[0], v[1], v[2]]),
+        lifeSpan: Math.max(0.01, e.lifeSpan),
+        squirt: !!e.squirt,
+        lineEmitter: (e.flags & 131072) !== 0,
+        modelSpace: (e.flags & 524288) !== 0,
+        xyQuad: (e.flags & 1048576) !== 0,
+        priorityPlane: e.priorityPlane ?? 0,
+      });
+    }
+    group.userData.emitters2 = emitters2;
+    const cam = (model.cameras as any[])?.[0];
+    if (cam) group.userData.camera = { position: Array.from(cam.position as Float32Array), target: Array.from(cam.targetPosition as Float32Array), fov: cam.fieldOfView, near: cam.nearClippingPlane, far: cam.farClippingPlane };
 
     if (skinned && seqs.length) {
       const sequences: SequenceInfo[] = seqs.map((s) => {
@@ -256,6 +297,7 @@ export class Wc3Assets {
         for (const m of meshes) visibility[m.mesh.name] = visibleIn(m, iv);
         return {
           name: String(s.name),
+          interval: iv,
           words: words(s),
           clip: new THREE.AnimationClip(String(s.name), duration, tracks),
           duration,
@@ -265,7 +307,7 @@ export class Wc3Assets {
           visibility,
         };
       });
-      this.anims.set(group, { sequences });
+      this.anims.set(group, { sequences, globals });
     }
     return group;
   }
@@ -273,6 +315,8 @@ export class Wc3Assets {
 
 export interface SequenceInfo {
   name: string;
+  /** Frame range in the model (ms) – for evaluating tracks at the current animation time. */
+  interval: [number, number];
   words: string[];
   clip: THREE.AnimationClip;
   duration: number;
@@ -283,6 +327,77 @@ export interface SequenceInfo {
 }
 export interface ModelAnimations {
   sequences: SequenceInfo[];
+  globals: number[];
+}
+
+/** Particle emitter 2 of a model template (see mdx-m3-viewer's ParticleEmitter2Object for the semantics). */
+export interface Emitter2Def {
+  /** Bone name of the emitter node in the (cloned) skeleton. */
+  node: string;
+  /** Parser object – animated tracks (KP2V visibility, KP2E rate, KP2S speed …). */
+  raw: any;
+  texture: THREE.Texture | null;
+  filterMode: number;
+  rows: number;
+  columns: number;
+  head: boolean;
+  tail: boolean;
+  tailLength: number;
+  timeMiddle: number;
+  colors: number[][];
+  scaling: number[];
+  intervals: number[][];
+  lifeSpan: number;
+  squirt: boolean;
+  lineEmitter: boolean;
+  modelSpace: boolean;
+  xyQuad: boolean;
+  priorityPlane: number;
+}
+
+/** Portrait camera stored in the model (Cameras chunk), model coordinates. */
+export interface ModelCamera {
+  position: number[];
+  target: number[];
+  fov: number;
+  near: number;
+  far: number;
+}
+
+/**
+ * Value of an animated scalar track at a given frame of a sequence (linear interpolation) and the index of the
+ * active keyframe (-1 when the track has no keys in the sequence → static value).
+ */
+export function evalTrackAt(obj: any, name: string, fallback: number, [start, end]: [number, number], frame: number, globals: number[], globalTime: number) {
+  const anim = (obj.animations as any[] | undefined)?.find((a) => a.name === name);
+  if (!anim || !anim.frames.length) return { value: fallback, key: -1 };
+  const gid = anim.globalSequenceId;
+  const global = gid >= 0 && globals[gid] !== undefined;
+  const lo = global ? 0 : start;
+  const hi = global ? globals[gid] : end;
+  const f = global ? (globals[gid] > 0 ? globalTime % globals[gid] : 0) : frame;
+  const frames: number[] = anim.frames;
+  let first = -1;
+  let k = -1;
+  for (let i = 0; i < frames.length; i++) {
+    if (frames[i] < lo || frames[i] > hi) continue;
+    if (first < 0) first = i;
+    if (frames[i] <= f) k = i;
+  }
+  if (first < 0) return { value: fallback, key: -1 };
+  if (k < 0) return { value: anim.values[first][0] as number, key: first };
+  const next = k + 1 < frames.length && frames[k + 1] <= hi ? k + 1 : -1;
+  if (next < 0 || anim.interpolationType === 0) return { value: anim.values[k][0] as number, key: k };
+  const t = (f - frames[k]) / Math.max(1, frames[next] - frames[k]);
+  return { value: anim.values[k][0] * (1 - t) + anim.values[next][0] * t, key: k };
+}
+
+/** The portrait sequence ("Portrait", not "Portrait Talk") of a portrait or unit model. */
+export function pickPortraitSequence(seqs: SequenceInfo[], tags: string[] = []) {
+  const portrait = seqs.filter((s) => s.words.includes('portrait') && !s.words.includes('talk'));
+  const score = (s: SequenceInfo) => tags.filter((t) => s.words.includes(t)).length * 100 - s.words.length;
+  if (portrait.length) return portrait.sort((a, b) => score(b) - score(a))[0];
+  return pickSequence(seqs, 'stand', tags) ?? seqs[0];
 }
 
 const words = (s: { name: string }) => String(s.name).toLowerCase().split(/[\s-]+/).filter(Boolean);

@@ -114,6 +114,8 @@ type Events = {
   unitAdded: Unit;
   unitRemoved: Unit;
   missileAdded: Missile;
+  /** Construction or upgrade finished (engine message "Dokončeno: …"). */
+  completed: Unit;
   end: { victory: boolean; text: string };
   quest: void;
 };
@@ -152,6 +154,8 @@ export class Game {
   readonly rects: GameConfig['regions'];
   private uidSeq = 1;
   private missileSeq = 1;
+  /** Attacks between the start of the swing and their damage point. */
+  private pendingShots: { u: Unit; t: Unit; at: number; auras: ReturnType<Game['auraSources']> }[] = [];
   /** Trigger "threads": generators that yield the number of seconds to sleep (TriggerSleepAction). */
   private threads: { gen: Thread; at: number; seq: number }[] = [];
   private threadSeq = 0;
@@ -853,6 +857,7 @@ export class Game {
         if (u.constructing.elapsed >= u.constructing.total) {
           u.constructing = null;
           u.anim = 'stand';
+          this.emit('completed', u);
         }
         continue;
       }
@@ -867,6 +872,7 @@ export class Game {
           u.target = null;
           this.emit('unitRemoved', u);
           this.emit('unitAdded', u);
+          this.emit('completed', u);
         }
         continue;
       }
@@ -891,6 +897,7 @@ export class Game {
       u.rects = now;
     }
 
+    this.firePendingShots();
     this.updateMissiles(dt);
 
     // Cleanup corpses after a short death animation.
@@ -1064,6 +1071,31 @@ export class Game {
     u.cooldown = a.cooldown / (1 + speedBonus);
     u.anim = 'attack';
     u.animTime = 0;
+    // The missile leaves / damage lands at the attack's damage point (udp1), not at the start of the swing.
+    if (a.damagePoint > 0) this.pendingShots.push({ u, t, at: this.time + a.damagePoint, auras });
+    else this.fire(u, t, auras);
+  }
+
+  private firePendingShots() {
+    if (!this.pendingShots.length) return;
+    const due = this.pendingShots.filter((s) => s.at <= this.time);
+    if (!due.length) return;
+    this.pendingShots = this.pendingShots.filter((s) => s.at > this.time);
+    const detectors = this.detectors();
+    for (const s of due) {
+      if (!s.u.alive || s.u.hidden || s.u.stunUntil > this.time) continue;
+      // Target lost before the damage point: the attack is cancelled and may restart immediately.
+      if (!this.canTarget(s.u, s.t, detectors)) {
+        s.u.cooldown = 0;
+        continue;
+      }
+      this.fire(s.u, s.t, s.auras);
+    }
+  }
+
+  private fire(u: Unit, t: Unit, auras: ReturnType<Game['auraSources']>) {
+    const a = u.def.attack!;
+    const detectors = this.detectors();
 
     let dmg = rollDamage(a.damageBase, a.dice, a.sides, this.rnd);
     dmg *= 1 + this.auraBonus(u, auras, 'ACac');
@@ -1107,23 +1139,29 @@ export class Game {
   }
 
   private launch(src: Unit, target: Unit, damage: number, speed: number, arc: number, color: number, model: string, isAbility: boolean): Missile {
-    const sz = src.kind === 'tower' ? Number(src.def.fields.ulpz ?? 140) : 60;
+    // Launch point: unit-relative offset (ulpx forward, ulpy left, ulpz up) rotated by the facing.
+    const [lx, ly, lz] = src.def.attack?.launch ?? [0, 0, 60];
+    const cos = Math.cos(src.facing);
+    const sin = Math.sin(src.facing);
+    const x0 = src.x + lx * cos - ly * sin;
+    const y0 = src.y + lx * sin + ly * cos;
+    const sz = lz + src.fly;
     const m: Missile = {
       id: this.missileSeq++,
       source: src,
       target,
       tx: target.x,
       ty: target.y,
-      x: src.x,
-      y: src.y,
+      x: x0,
+      y: y0,
       z: sz,
-      sx: src.x,
-      sy: src.y,
+      sx: x0,
+      sy: y0,
       sz,
       speed,
       arc,
       traveled: 0,
-      total: Math.hypot(target.x - src.x, target.y - src.y),
+      total: Math.hypot(target.x - x0, target.y - y0),
       homing: src.def.attack?.homing ?? true,
       damage,
       bounce: null,
@@ -1161,7 +1199,7 @@ export class Game {
       m.traveled += step;
       const total = Math.max(m.total, m.traveled + d);
       const t = m.traveled / total;
-      const targetZ = m.target ? m.target.fly + 50 : 50;
+      const targetZ = m.target ? m.target.fly + m.target.def.impactZ : 50;
       m.z = m.sz + (targetZ - m.sz) * t + m.arc * total * 2 * t * (1 - t);
     }
     this.missiles = this.missiles.filter((m) => !m.done);

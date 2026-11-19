@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="cs">
   <head>
     <meta charset="UTF-8" />
@@ -13,36 +13,80 @@
       <div id="drag-box" hidden></div>
       <div id="fade"></div>
 
-      <div id="topbar">
-        <div class="res" title="Gold"><span class="gold-icon"></span><span id="gold">0</span></div>
-        <div class="res" title="Lives"><span class="life-icon">♥</span><span id="lives">0</span></div>
-        <div class="res" id="clock"></div>
-        <div class="spacer"></div>
-        <button id="btn-speed" title="Game speed">1×</button>
-        <button id="btn-music" title="Music" hidden>♫</button>
-        <button id="btn-pause" title="Pause (Pause/F10)">❚❚</button>
-        <button id="btn-regions" title="Regions &amp; creep path (F2)">Regions</button>
-        <button id="btn-pathing" title="Pathing map overlay (F3)">Pathing</button>
-        <button id="btn-quests" title="Quests (F9)">Quests</button>
-        <button id="btn-help" title="Help (F1)">?</button>
-      </div>
-
-      <div id="multiboard" hidden>
-        <div class="mb-title" id="mb-title"></div>
-        <table id="mb-table"></table>
-      </div>
-
-      <div id="messages"></div>
-
-      <div id="bottom">
+      <!-- Human console (UI\FrameDef\UI\ConsoleUI.fdf): positions in UI units of the 0.8 × 0.6 screen, see style.css -->
+      <div id="ui">
+        <div class="backing" id="bk-minimap"></div>
+        <div class="backing" id="bk-info"></div>
+        <div class="backing" id="bk-card"></div>
+        <div class="backing" id="bk-portrait-text"></div>
         <div id="minimap-wrap"><canvas id="minimap" width="256" height="256"></canvas></div>
+        <div id="clock"><div id="clock-sky"></div></div>
+        <div class="tile" id="t1-top"></div>
+        <div class="tile" id="t2-top-l"></div>
+        <div class="tile" id="t2-top-r"></div>
+        <div class="tile" id="t3-top"></div>
+        <div class="tile" id="t4-top"></div>
+        <div class="tile" id="clock-frame"></div>
+        <div class="tile" id="t1-bottom"></div>
+        <div class="tile" id="t2-bottom"></div>
+        <div class="tile" id="t3-bottom"></div>
+        <div class="tile" id="t4-bottom"></div>
+        <div class="tile" id="inventory-cover"></div>
+        <div class="block" id="block-top"></div>
+        <div class="block" id="block-1"></div>
+        <div class="block" id="block-2"></div>
+        <div class="block" id="block-3"></div>
+
+        <div id="upper-buttons">
+          <button class="upper" id="btn-quests" title="Úkoly (F9)">Úkoly <span class="hk">(F9)</span></button>
+          <button class="upper" id="btn-menu" title="Nabídka (F10)">Nabídka <span class="hk">(F10)</span></button>
+          <button class="upper" id="btn-allies" title="Spojenci (F11)">Spojenci <span class="hk">(F11)</span></button>
+          <button class="upper" id="btn-chat" title="Chat (F12)">Chat <span class="hk">(F12)</span></button>
+        </div>
+        <div id="resources">
+          <span class="res-icon" id="ri-gold"></span><span class="res-text" id="gold">0</span>
+          <span class="res-icon" id="ri-lumber"></span><span class="res-text" id="lumber">0</span>
+          <span class="res-icon" id="ri-supply"></span><span class="res-text" id="supply">0/10</span>
+          <span id="upkeep">Žádná údržba</span>
+        </div>
+
+        <div id="multiboard" hidden>
+          <div id="mb-title" class="wc3-box"></div>
+          <div id="mb-min" class="wc3-box"></div>
+          <div id="mb-body" class="wc3-box"><table id="mb-table"></table></div>
+        </div>
+
+        <div id="messages"></div>
+        <div id="sys-messages"></div>
+        <div id="idle-worker" title="Nečinný dělník (Tab)"><span class="count">1</span></div>
+
+        <div id="minimap-buttons">
+          <div class="mm-btn" id="mm-ping" title="Signál (Alt+G)"></div>
+          <div class="mm-btn" id="mm-terrain" title="Zobrazit terén"></div>
+          <div class="mm-btn" id="mm-ally" title="Barvy spojenců (Alt+A)"></div>
+          <div class="mm-btn" id="mm-creep" title="Zobrazit příšery"></div>
+          <div class="mm-btn round" id="mm-formation" title="Formace"></div>
+        </div>
+        <div id="portrait"></div>
+        <div id="portrait-hp"></div>
+        <div id="portrait-mp"></div>
         <div id="info"></div>
         <div id="card"></div>
+        <div id="tooltip" class="wc3-tooltip" hidden></div>
       </div>
 
-      <div id="tooltip" hidden></div>
-      <div id="dialog" hidden></div>
-      <div id="modal" hidden></div>
+      <div id="menu" class="wc3-panel" hidden>
+        <h2>Nabídka</h2>
+        <button id="btn-pause">Pozastavit hru (Pause)</button>
+        <button id="btn-speed">Rychlost hry: 1×</button>
+        <button id="btn-music" hidden>Hudba</button>
+        <button id="btn-regions">Regiony a trasa příšer (F2)</button>
+        <button id="btn-pathing">Mapa průchodnosti (F3)</button>
+        <button id="btn-help">Nápověda (F1)</button>
+        <button id="btn-menu-close">Návrat do hry</button>
+      </div>
+      <div id="dialog" class="wc3-panel" hidden></div>
+      <div id="modal" class="wc3-panel" hidden></div>
       <div id="loading">Načítám mapu…</div>
     </div>
     <script type="module" src="/src/main.ts"></script>

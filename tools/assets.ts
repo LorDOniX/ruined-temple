@@ -405,8 +405,34 @@ async function main() {
   };
   for (const t of Object.values(map.objects)) for (const o of Object.values(t)) objectFields(o.fields);
   for (const t of [catalog.units, catalog.abilities, catalog.upgrades]) for (const f of Object.values(t)) objectFields(f);
-  for (const p of ['BTNMove', 'BTNStop', 'BTNHumanBuild', 'BTNCancel']) want(`ReplaceableTextures\\CommandButtons\\${p}.blp`);
+  for (const p of ['BTNMove', 'BTNStop', 'BTNHumanBuild', 'BTNCancel', 'BTNAttack', 'BTNPatrol', 'BTNRepair', 'BTNHoldPosition', 'BTNPeasant', 'BTNDeathCoil', 'BTNSnazzyPotion']) want(`ReplaceableTextures\\CommandButtons\\${p}.blp`);
+  // Portraits: "<model>_portrait.mdx" next to every unit model (optional – the main model is the fallback).
+  for (const t of [map.objects.w3u ?? {}]) for (const o of Object.values(t)) {
+    const m = o.fields.umdl ?? catalog.units[o.base]?.umdl;
+    if (typeof m === 'string' && m.trim()) want(`${m.trim().replace(/\.md[lx]$/i, '')}_portrait.mdx`);
+  }
+  // Human console (UI\war3skins.txt [Human] + UI\FrameDef\UI\ConsoleUI.fdf, ResourceBar.fdf, MultiBoard.fdf …).
+  const ui = [
+    'UI\\Console\\Human\\HumanUITile01.blp', 'UI\\Console\\Human\\HumanUITile02.blp', 'UI\\Console\\Human\\HumanUITile03.blp', 'UI\\Console\\Human\\HumanUITile04.blp',
+    'UI\\Console\\Human\\HumanUITile-InventoryCover.blp', 'UI\\Console\\Human\\HumanUITile-TimeIndicatorFrame.blp', 'UI\\Console\\Human\\HumanUITile-TimeIndicator.blp',
+    'UI\\Widgets\\Console\\Human\\human-console-buttonstates2.blp', 'UI\\Widgets\\Console\\Human\\CommandButton\\human-activebutton.blp',
+    'UI\\Feedback\\Resources\\ResourceGold.blp', 'UI\\Feedback\\Resources\\ResourceLumber.blp', 'UI\\Feedback\\Resources\\ResourceSupply.blp', 'UI\\Feedback\\Resources\\ResourceUpkeep.blp',
+    'UI\\Widgets\\ToolTips\\Human\\human-tooltip-background.blp', 'UI\\Widgets\\ToolTips\\Human\\human-tooltip-border.blp', 'UI\\Widgets\\ToolTips\\Human\\ToolTipGoldIcon.blp',
+    'UI\\Widgets\\EscMenu\\Human\\editbox-border.blp', 'UI\\Widgets\\EscMenu\\Human\\editbox-background.blp', 'UI\\Widgets\\Glues\\Gluescreen-Scrollbar-UpArrow.blp',
+    'UI\\Widgets\\EscMenu\\Human\\human-options-menu-background.blp', 'UI\\Widgets\\EscMenu\\Human\\human-options-menu-border.blp',
+    'UI\\Widgets\\EscMenu\\Human\\human-options-button-border-up.blp', 'UI\\Widgets\\EscMenu\\Human\\human-options-button-highlight.blp',
+    'Fonts\\FRIZQT__.TTF',
+  ];
+  for (const b of ['ping-active', 'terrain-active', 'ally-off', 'creep-active', 'formation-off']) ui.push(`UI\\Widgets\\Console\\Human\\human-${b.startsWith('formation') ? b : `minimap-${b}`}.blp`);
+  for (const k of ['attack-melee', 'attack-piercing', 'attack-siege', 'attack-magic', 'attack-chaos', 'attack-hero', 'armor-small', 'armor-medium', 'armor-large', 'armor-fortified', 'armor-hero', 'armor-unarmored', 'armor-divine']) {
+    ui.push(`UI\\Widgets\\Console\\Human\\infocard-${k}.blp`);
+    if (k !== 'armor-divine') ui.push(`UI\\Widgets\\Console\\Human\\infocard-neutral-${k}.blp`);
+  }
+  for (const p of ui) want(p);
   want('Abilities\\Spells\\Human\\MassTeleport\\MassTeleportTarget.mdx');
+  // Order confirmations (UI\\war3skins.txt: TargetPointConfirm / TargetUnitConfirm).
+  want('UI\\Feedback\\Confirmation\\Confirmation.mdx');
+  want('UI\\Feedback\\Target\\Target.mdx');
   want('Abilities\\Spells\\Other\\Transmute\\PileofGold.mdx');
   want('Objects\\StartLocation\\StartLocation.mdx');
   const sounds = [...Object.values(map.game.sounds).map((s) => s.file), ...map.sounds.map((s) => s.file)];
@@ -426,7 +452,7 @@ async function main() {
   const done = new Set<string>();
   const missing: string[] = [];
   const queue = [...wanted];
-  const optional = (p: string) => /\.(flac|mp3)$/i.test(p) || /\.wav$/i.test(p) || /Terrain\\(City)?Cliffs\\/i.test(p) || /\d\.mdx$/i.test(p);
+  const optional = (p: string) => /\.(flac|mp3)$/i.test(p) || /\.wav$/i.test(p) || /Terrain\\(City)?Cliffs\\/i.test(p) || /\d\.mdx$/i.test(p) || /_portrait\.mdx$/i.test(p);
   const write = (key: string, bytes: Uint8Array) => {
     copied.add(key);
     const dest = join(out, key.replace(/\\/g, '/'));

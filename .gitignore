@@ -1,9 +1,11 @@
 node_modules/
 dist/
 # Generated from the .w3x (npm run extract)
-data/
+/data/
 # Original Blizzard game assets (npm run assets) - never commit
 public/war3/
 # Local game install / texture mods
 Warcraft III*/
 Classic HD*/
+# Gameplay recordings used for comparison
+*.mp4

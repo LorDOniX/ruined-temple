@@ -31,7 +31,8 @@ export class RtsCamera {
     });
     addEventListener('keyup', (e) => this.keys.delete(e.key));
     addEventListener('blur', () => this.keys.clear());
-    dom.addEventListener('mousemove', (e) => {
+    // Window-wide so edge scrolling also works over the console / top bar.
+    addEventListener('mousemove', (e) => {
       const r = dom.getBoundingClientRect();
       this.mouse = { x: e.clientX - r.left, y: e.clientY - r.top, inside: true };
       if (this.drag) {
@@ -41,7 +42,7 @@ export class RtsCamera {
         this.clamp();
       }
     });
-    dom.addEventListener('mouseleave', () => (this.mouse.inside = false));
+    document.addEventListener('mouseleave', () => (this.mouse.inside = false));
     dom.addEventListener('mousedown', (e) => {
       if (e.button === 1) {
         e.preventDefault();

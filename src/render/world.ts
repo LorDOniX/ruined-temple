@@ -5,6 +5,7 @@ import { CREEP_PLAYER, PLAYER_COLORS, attackColor, type Destructable, type Game,
 import { TerrainGrid } from './terrain';
 import { clone as cloneSkinned } from 'three/examples/jsm/utils/SkeletonUtils.js';
 import { Wc3Assets, applyReplaceable, applyTeamColor, instantiate, pickSequence, type ModelAnimations, type SequenceInfo } from './mdx';
+import { ParticleSystem } from './particles';
 import {
   auraTowerPlaceholder,
   builderPlaceholder,
@@ -43,14 +44,26 @@ interface UnitAnim {
   lastAnimTime: number;
 }
 
+interface MissileView {
+  obj: THREE.Group;
+  /** Animation state shared with the particle emitters (stand while flying, death at impact). */
+  state: { seq: SequenceInfo | null; action: THREE.AnimationAction | null };
+  mixer: THREE.AnimationMixer | null;
+  info: ModelAnimations | null;
+  last: THREE.Vector3 | null;
+  owner: number;
+}
+
 const tmpV = new THREE.Vector3();
 
 /** Owns all scene objects that mirror the game state. Everything lives in `world` (WC3 Z-up coordinates). */
 export class WorldView {
   readonly world = new THREE.Group();
   private units = new Map<number, UnitView>();
-  private missiles = new Map<number, THREE.Object3D>();
-  private effects: { obj: THREE.Object3D; until: number; start: number; kind: 'ring' | 'line' }[] = [];
+  private missiles = new Map<number, MissileView>();
+  readonly particles: ParticleSystem;
+  private hover: { el: HTMLElement; unit: Unit; bar: HTMLElement } | null = null;
+  private effects: { obj: THREE.Object3D; until: number; start: number; kind: 'ring' | 'line' | 'model'; mixer?: THREE.AnimationMixer; game?: boolean }[] = [];
   private destructables = new Map<string, THREE.Group>();
   private spawnPortal: THREE.Object3D[] = [];
   private regionsGroup = new THREE.Group();
@@ -58,8 +71,10 @@ export class WorldView {
   private ghostCells: THREE.InstancedMesh;
   private ghostModel: THREE.Object3D | null = null;
   private ghostId = '';
-  /** Currently selected units (selection circles, HP bars). */
+  /** Currently selected units (selection circles). */
   selection = new Set<Unit>();
+  /** Health bars above all units – like the game, only while Alt is held. */
+  showAllHp = false;
   private hpMatBg = new THREE.SpriteMaterial({ color: 0x000000, depthTest: false });
   private hpMats = [0xff2020, 0xffd020, 0x20ff20].map((c) => new THREE.SpriteMaterial({ color: c, depthTest: false }));
   private floatLayer: HTMLElement;
@@ -88,6 +103,7 @@ export class WorldView {
     this.world.add(this.ghost);
 
     this.floatLayer = overlayRoot;
+    this.particles = new ParticleSystem(this.world);
 
     game.on('unitAdded', (u) => this.addUnit(u));
     game.on('unitRemoved', (u) => this.removeUnit(u));
@@ -276,7 +292,9 @@ export class WorldView {
     const h = Number(model.userData.height) || 0;
     view.height = Math.min(600, Math.max(60, (h || 120) * u.def.scale));
     const info = this.assets.animations(model);
-    view.anim = { model: m, mixer: info ? new THREE.AnimationMixer(m) : null, info, current: '', seq: null, action: null, lastAnimTime: 0 };
+    const anim: UnitAnim = { model: m, mixer: info ? new THREE.AnimationMixer(m) : null, info, current: '', seq: null, action: null, lastAnimTime: 0 };
+    view.anim = anim;
+    if (info) this.particles.attach(m, model, () => (anim.seq && anim.action ? { interval: anim.seq.interval, frame: anim.seq.interval[0] + anim.action.time * 1000 } : null), info.globals);
   }
 
   /** Plays the unit's current animation with the matching MDX sequence (animation tags from the "uani" field). */
@@ -330,10 +348,97 @@ export class WorldView {
     this.units.delete(u.uid);
   }
 
+  /**
+   * Missiles use the weapon's projectile model (ua1m): the "stand" sequence loops while flying, oriented
+   * along the flight path; at impact the model plays its "death" sequence (explosion, particles) in place.
+   */
   private addMissile(m: Missile) {
-    const obj = missilePlaceholder(m.color);
+    const obj = new THREE.Group();
+    obj.rotation.order = 'ZYX';
+    obj.position.set(m.x, m.y, this.grid.heightAt(m.x, m.y) + m.z);
     this.world.add(obj);
-    this.missiles.set(m.id, obj);
+    const mv: MissileView = { obj, state: { seq: null, action: null }, mixer: null, info: null, last: null, owner: m.source.owner };
+    this.missiles.set(m.id, mv);
+    const path = m.model.replace(/\.md[lx]$/i, '');
+    if (!this.assets || !path || !this.assets.modelExists(path)) {
+      obj.add(missilePlaceholder(m.color));
+      return;
+    }
+    void this.assets.loadModel(path).then((model) => {
+      if (!model || !obj.parent) return;
+      const inst = cloneSkinned(model);
+      applyTeamColor(this.assets!, inst, mv.owner);
+      obj.add(inst);
+      const info = this.assets!.animations(model);
+      if (!info) return;
+      mv.info = info;
+      mv.mixer = new THREE.AnimationMixer(inst);
+      this.playMissile(mv, 'stand');
+      this.particles.attach(inst, model, () => (mv.state.seq && mv.state.action ? { interval: mv.state.seq.interval, frame: mv.state.seq.interval[0] + mv.state.action.time * 1000 } : null), info.globals);
+    });
+  }
+
+  private playMissile(mv: MissileView, name: 'stand' | 'death') {
+    if (!mv.mixer || !mv.info) return null;
+    const seq = pickSequence(mv.info.sequences, name) ?? (name === 'stand' ? mv.info.sequences.find((q) => !q.words.includes('death')) : undefined);
+    if (!seq) return null;
+    mv.mixer.stopAllAction();
+    const action = mv.mixer.clipAction(seq.clip);
+    action.reset();
+    action.setLoop(name === 'death' ? THREE.LoopOnce : THREE.LoopRepeat, Infinity);
+    action.clampWhenFinished = name === 'death';
+    action.play();
+    mv.state.seq = seq;
+    mv.state.action = action;
+    mv.obj.traverse((o) => {
+      if ((o as THREE.Mesh).isMesh && o.name in seq.visibility) o.visible = seq.visibility[o.name];
+    });
+    return seq;
+  }
+
+  /**
+   * Order confirmation like WC3 (UI\\war3skins.txt): TargetPointConfirm = Confirmation.mdl (three curved arrows
+   * converging on the clicked point), TargetUnitConfirm = Target.mdl on a targeted unit. The models are white,
+   * the engine tints them – green for move, red for attack. Without game assets a shrinking ring stands in.
+   */
+  orderConfirmation(x: number, y: number, kind: 'move' | 'attack' = 'move', onUnit = false) {
+    const z = this.grid.heightAt(x, y) + 2;
+    const tint = kind === 'attack' ? 0xff2020 : 0x20ff20;
+    const path = onUnit ? 'UI\\Feedback\\Target\\Target' : 'UI\\Feedback\\Confirmation\\Confirmation';
+    if (!this.assets?.modelExists(path)) {
+      const r = ringMesh(70, kind === 'attack' ? 0xff3030 : 0x30ff30, 0.9, 10);
+      r.position.set(x, y, z + 4);
+      this.world.add(r);
+      this.effects.push({ obj: r, start: this.clock, until: this.clock + 0.5, kind: 'ring' });
+      return;
+    }
+    const start = this.clock;
+    void this.assets.loadModel(path).then((model) => {
+      if (!model) return;
+      const m = cloneSkinned(model);
+      m.position.set(x, y, z);
+      m.traverse((o) => {
+        const mesh = o as THREE.Mesh;
+        if (!mesh.isMesh) return;
+        mesh.renderOrder = 6;
+        mesh.material = (mesh.material as THREE.MeshBasicMaterial).clone();
+        (mesh.material as THREE.MeshBasicMaterial).color.setHex(tint);
+      });
+      const anims = this.assets!.animations(model);
+      const seq = anims?.sequences[0];
+      let mixer: THREE.AnimationMixer | undefined;
+      if (seq) {
+        mixer = new THREE.AnimationMixer(m);
+        const action = mixer.clipAction(seq.clip);
+        action.setLoop(THREE.LoopOnce, 1);
+        action.clampWhenFinished = true;
+        action.play();
+        mixer.update(this.clock - start);
+      }
+      this.world.add(m);
+      const life = Number(model.userData.lifetime) || 1;
+      this.effects.push({ obj: m, start, until: start + life, kind: 'model', mixer });
+    });
   }
 
   private ring(x: number, y: number, color: number) {
@@ -451,7 +556,7 @@ export class WorldView {
       }
       v.selection.visible = this.selection.has(u) && u.alive;
       v.selection.position.z = 4 - u.fly;
-      const showHp = u.alive && (u.owner === CREEP_PLAYER ? u.hp < u.maxHp || this.selection.has(u) : this.selection.has(u) || !!u.constructing || !!u.upgrading);
+      const showHp = u.alive && !u.hidden && (this.showAllHp || !!u.constructing || !!u.upgrading);
       v.hpBg.visible = v.hpFg.visible = showHp;
       if (showHp) {
         const w = Math.max(50, u.def.selectionScale * 40);
@@ -468,20 +573,37 @@ export class WorldView {
         v.hpFg.material = progress !== null ? this.hpMats[1] : this.hpMats[ratio > 0.66 ? 2 : ratio > 0.33 ? 1 : 0];
       }
     }
-    for (const [id, obj] of this.missiles) {
+    const gdt = g.paused ? 0 : dt * g.speed;
+    for (const [id, mv] of this.missiles) {
       const m = g.missiles.find((x) => x.id === id);
       if (!m) {
-        this.world.remove(obj);
+        // Impact: the projectile model's death sequence plays where it hit.
         this.missiles.delete(id);
+        const seq = this.playMissile(mv, 'death');
+        if (seq && mv.mixer) {
+          this.effects.push({ obj: mv.obj, start: this.clock, until: this.clock + Math.min(4, Math.max(0.2, seq.duration)), kind: 'model', mixer: mv.mixer, game: true });
+        } else this.world.remove(mv.obj);
         continue;
       }
-      obj.position.set(m.x, m.y, this.grid.heightAt(m.x, m.y) + m.z);
+      const p = tmpV.set(m.x, m.y, this.grid.heightAt(m.x, m.y) + m.z);
+      if (mv.last && p.distanceToSquared(mv.last) > 0.01) {
+        const dx = p.x - mv.last.x;
+        const dy = p.y - mv.last.y;
+        mv.obj.rotation.set(0, -Math.atan2(p.z - mv.last.z, Math.hypot(dx, dy)), Math.atan2(dy, dx));
+      } else if (!mv.last) mv.obj.rotation.set(0, 0, Math.atan2(m.ty - m.y, m.tx - m.x));
+      mv.obj.position.copy(p);
+      (mv.last ??= new THREE.Vector3()).copy(p);
+      mv.mixer?.update(gdt);
     }
     this.effects = this.effects.filter((e) => {
       const t = (this.clock - e.start) / (e.until - e.start);
       if (t >= 1) {
         this.world.remove(e.obj);
         return false;
+      }
+      if (e.kind === 'model') {
+        e.mixer?.update(e.game ? gdt : dt);
+        return true;
       }
       if (e.kind === 'ring') e.obj.scale.setScalar(1 + t * 1.5);
       const m = (e.obj as THREE.Mesh).material as THREE.Material;
@@ -494,6 +616,8 @@ export class WorldView {
       else if (!d.alive) obj.scale.set(d.scale, d.scale, Math.max(0.15, obj.scale.z - dt * 2));
       else obj.scale.setScalar(d.scale);
     }
+    this.particles.update(gdt, camera);
+    this.updateHover(camera, width, height);
     // Float texts (CreateTextTag: velocity 64 upward, fading).
     this.floats = this.floats.filter((f) => {
       const t = this.clock - f.start;
@@ -506,6 +630,48 @@ export class WorldView {
       f.el.style.opacity = String(Math.min(1, (f.life - t) / Math.max(0.3, f.life * 0.5)));
       return true;
     });
+  }
+
+  /**
+   * Mouse-over label like WC3: the owner's name in a gold-bordered box with the unit's health bar below,
+   * floating above the unit under the cursor.
+   */
+  setHover(u: Unit | null, ownerName: (u: Unit) => { name: string; color: string }) {
+    if (this.hover?.unit === u) return;
+    this.hover?.el.remove();
+    this.hover = null;
+    if (!u) return;
+    const el = document.createElement('div');
+    el.className = 'hover-label';
+    const o = ownerName(u);
+    const name = document.createElement('div');
+    name.className = 'hover-name';
+    name.textContent = o.name;
+    name.style.color = o.color;
+    const bar = document.createElement('div');
+    bar.className = 'hover-hp';
+    bar.appendChild(document.createElement('div'));
+    el.append(name, bar);
+    this.floatLayer.appendChild(el);
+    this.hover = { el, unit: u, bar };
+  }
+
+  private updateHover(camera: THREE.Camera, width: number, height: number) {
+    const h = this.hover;
+    if (!h) return;
+    const u = h.unit;
+    const v = this.units.get(u.uid);
+    if (!v || !u.alive || u.hidden) {
+      this.setHover(null, () => ({ name: '', color: '' }));
+      return;
+    }
+    const p = this.world.localToWorld(tmpV.set(u.x, u.y, this.grid.heightAt(u.x, u.y) + u.fly + v.height + 40)).project(camera);
+    h.el.style.transform = `translate(${((p.x + 1) / 2) * width}px, ${((1 - p.y) / 2) * height}px) translate(-50%, -100%)`;
+    const ratio = Math.max(0, u.hp / u.maxHp);
+    const fill = h.bar.firstChild as HTMLElement;
+    fill.style.width = `${(ratio * 100).toFixed(1)}%`;
+    fill.style.background = ratio > 0.66 ? '#20e020' : ratio > 0.33 ? '#e0d020' : '#e02020';
+    h.bar.hidden = u.def.abilities.includes('Avul');
   }
 
   /** Units whose projected position (body centre) lies inside a screen rectangle. */
