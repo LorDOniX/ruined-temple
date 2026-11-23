@@ -18,6 +18,7 @@ import { parsers } from 'mdx-m3-viewer';
 import { PNG } from 'pngjs';
 import { decodeDds } from './lib/dds';
 import { CLIFF_STYLES, TILE_STYLES, resample } from '../src/render/textures';
+import { TerrainGrid, cliffInstances } from '../src/render/terrain';
 import type { AssetCatalog, MapData } from '../src/data/types';
 
 type Row = Record<string, string>;
@@ -206,10 +207,12 @@ async function main() {
     while (args[i + 1] && !args[i + 1].startsWith('--')) list.push(args[++i]);
     return [list, i] as const;
   };
+  const gameDirs: string[] = [];
   for (let i = 0; i < args.length; i++) {
     let list: readonly string[];
     if (args[i] === '--game') {
       [list, i] = take(i);
+      gameDirs.push(...list);
       for (const g of list) sources.push(...(await mpqSources(gameArchives(g))));
     } else if (args[i] === '--mpq') {
       [list, i] = take(i);
@@ -327,8 +330,8 @@ async function main() {
   for (const id of map.terrain.cliffTilesets) {
     const r = cliffs.get(id);
     const g = CLIFF_STYLES[id];
-    if (r) catalog.cliffs[id] = { texture: `${r.texdir}\\${r.texfile}`, modelDir: r.cliffmodeldir, groundTile: r.groundtile, name: westr(r.name ?? id) };
-    else if (g) catalog.cliffs[id] = { texture: g.file, modelDir: g.modelDir, groundTile: g.groundTile, name: g.name };
+    if (r) catalog.cliffs[id] = { texture: `${r.texdir}\\${r.texfile}`, modelDir: r.cliffmodeldir, rampDir: r.rampmodeldir, groundTile: r.groundtile, name: westr(r.name ?? id) };
+    else if (g) catalog.cliffs[id] = { texture: g.file, modelDir: g.modelDir, rampDir: g.rampDir, groundTile: g.groundTile, name: g.name };
   }
   const wr = water.get(`${map.terrain.tileset}Sha`);
   if (wr) {
@@ -385,6 +388,12 @@ async function main() {
     const dir = c.modelDir;
     for (const a of 'ABC') for (const b of 'ABC') for (const cc of 'ABC') for (const d of 'ABC') for (let v = 0; v < 4; v++) want(`Doodads\\Terrain\\${dir}\\${dir}${a}${b}${cc}${d}${v}.mdx`);
   }
+  // Ramp models (CliffTrans / CityCliffTrans) the map's ramps need.
+  {
+    const ids = map.terrain.cliffTilesets;
+    const ramps = cliffInstances(new TerrainGrid(map.terrain), ids.map((id) => catalog.cliffs[id]?.modelDir ?? 'Cliffs'), ids.map((id) => catalog.cliffs[id]?.rampDir ?? ''));
+    for (const r of ramps) if (r.w * r.h > 1) wantModel(r.path);
+  }
   for (const [id, d] of Object.entries(catalog.doodads)) {
     const custom = map.objects.w3d?.[id]?.fields?.dfil ?? map.objects.w3b?.[id]?.fields?.bfil;
     if (custom) wantModel(String(custom));
@@ -425,7 +434,9 @@ async function main() {
     'UI\\Widgets\\EscMenu\\Human\\human-options-button-border-up.blp', 'UI\\Widgets\\EscMenu\\Human\\human-options-button-highlight.blp',
     'Fonts\\FRIZQT__.TTF',
   ];
-  for (const b of ['ping-active', 'terrain-active', 'ally-off', 'creep-active', 'formation-off']) ui.push(`UI\\Widgets\\Console\\Human\\human-${b.startsWith('formation') ? b : `minimap-${b}`}.blp`);
+  for (const b of ['ping-active', 'ping-active-down', 'terrain-active', 'terrain-inactive', 'ally-off', 'ally-active', 'ally-inactive', 'creep-active', 'creep-inactive', 'formation-off', 'formation-on']) ui.push(`UI\\Widgets\\Console\\Human\\human-${b.startsWith('formation') ? b : `minimap-${b}`}.blp`);
+  // Minimap signal (Alt+G): UI\war3skins.txt MinimapIndicator = Minimap-Ping.mdl (ring ping2 + arrows ping5).
+  ui.push('UI\\Minimap\\Minimap-Ping.mdx');
   for (const k of ['attack-melee', 'attack-piercing', 'attack-siege', 'attack-magic', 'attack-chaos', 'attack-hero', 'armor-small', 'armor-medium', 'armor-large', 'armor-fortified', 'armor-hero', 'armor-unarmored', 'armor-divine']) {
     ui.push(`UI\\Widgets\\Console\\Human\\infocard-${k}.blp`);
     if (k !== 'armor-divine') ui.push(`UI\\Widgets\\Console\\Human\\infocard-neutral-${k}.blp`);
@@ -453,7 +464,7 @@ async function main() {
   // --- sounds and model event objects -------------------------------------------------------------
   // Keys of these tables may carry trailing spaces in the SLKs ("OBKB "), event names too ("SNDXAHSL ").
   const trimmed = (t: Map<string, Row>) => new Map([...t].map(([k, v]) => [k.trim(), v]));
-  const soundTables = ['AnimSounds', 'UnitAckSounds', 'UnitCombatSounds', 'UISounds', 'AbilitySounds'].map((t) => trimmed(slk(`UI\\SoundInfo\\${t}.slk`)));
+  const soundTables = ['AnimSounds', 'UnitAckSounds', 'UnitCombatSounds', 'UISounds', 'AbilitySounds', 'AmbienceSounds'].map((t) => trimmed(slk(`UI\\SoundInfo\\${t}.slk`)));
   const animLookups = trimmed(slk('UI\\SoundInfo\\AnimLookups.slk'));
   const splatData = trimmed(slk('Splats\\SplatData.slk'));
   const uberSplatData = trimmed(slk('Splats\\UberSplatData.slk'));
@@ -498,6 +509,7 @@ async function main() {
       maxDistance: num(row, 'MaxDistance'),
       distanceCutoff: num(row, 'DistanceCutoff'),
       channel: num(row, 'Channel'),
+      priority: num(row, 'Priority'),
       flags: row.flags ?? '',
     };
     for (const f of files) want(f);
@@ -618,6 +630,26 @@ async function main() {
   const dnc = (kind: string) => `Environment\\DNC\\DNC${dncName}\\DNC${dncName}${kind}\\DNC${dncName}${kind}`;
   wantModel(dnc('Terrain'));
   wantModel(dnc('Unit'));
+  // Ambience: SetAmbientDaySound / SetAmbientNightSound in the map script → MIDISounds.slk (MIDI + DLS bank);
+  // the engine also plays a rooster at dawn and a wolf at dusk (AmbienceSounds RoosterSound / WolfSound).
+  const midiSounds = trimmed(slk('UI\\SoundInfo\\MIDISounds.slk'));
+  const script = existsSync('public/map/war3map.j') ? readFileSync('public/map/war3map.j', 'utf8') : '';
+  const ambient = (fn: string) => {
+    const label = new RegExp(`${fn}\\(\\s*"([^"]+)"`).exec(script)?.[1];
+    const r = label ? midiSounds.get(label) : undefined;
+    if (!r?.midifilename || !r.dlsfilename) return undefined;
+    const dir = (r.directorybase ?? '').replace(/\\?$/, '\\');
+    want(dir + r.midifilename);
+    want(dir + r.dlsfilename);
+    return { midi: dir + r.midifilename, dls: dir + r.dlsfilename, volume: num(r, 'Volume') || 100 };
+  };
+  catalog.ambient = {
+    day: ambient('SetAmbientDaySound'),
+    night: ambient('SetAmbientNightSound'),
+    dawn: addSound('RoosterSound') ? 'RoosterSound' : undefined,
+    dusk: addSound('WolfSound') ? 'WolfSound' : undefined,
+  };
+  addSound('BuildingConstructionLoop');
   catalog.ui = {
     cursor: cursor.replace(/\.md[lx]$/i, ''),
     dnc: { terrain: dnc('Terrain'), unit: dnc('Unit') },
@@ -633,7 +665,7 @@ async function main() {
   const copied = new Set<string>();
   const done = new Set<string>();
   const missing: string[] = [];
-  const optional = (p: string) => /\.(flac|mp3)$/i.test(p) || /\.wav$/i.test(p) || /Terrain\\(City)?Cliffs\\/i.test(p) || /\d\.mdx$/i.test(p) || /_portrait\.mdx$/i.test(p);
+  const optional = (p: string) => /\.(flac|mp3|mid|dls)$/i.test(p) || /\.wav$/i.test(p) || /Terrain\\(City)?Cliffs\\/i.test(p) || /\d\.mdx$/i.test(p) || /_portrait\.mdx$/i.test(p);
   const write = (key: string, bytes: Uint8Array) => {
     copied.add(key);
     const dest = join(out, key.replace(/\\/g, '/'));
@@ -682,6 +714,8 @@ async function main() {
         model.load(new Uint8Array(bytes).slice().buffer);
         for (const t of model.textures) if (t.path) queue.push(t.path);
         for (const e of model.eventObjects) addEventObject(e.name);
+        // ParticleEmitter (type 1) spawns whole models as particles.
+        for (const e of model.particleEmitters) if (e.path && /\.md[lx]$/i.test(e.path)) queue.push(`${e.path.replace(/\.md[lx]$/i, '')}.mdx`);
       } catch (e) {
         console.warn(`  could not parse ${p}: ${e}`);
       }
@@ -691,6 +725,11 @@ async function main() {
   const soundOk = (s: string) => ['.wav', '.flac', '.mp3'].some((ext) => copied.has(norm(s.replace(/\.(wav|flac|mp3)$/i, '') + ext)));
   const missingSounds = sounds.filter((s) => !soundOk(s));
 
+  // The player's keyboard shortcuts (CustomKeys.txt in the game folder, optional).
+  for (const g of gameDirs) {
+    const f = readdirSync(g).find((n) => n.toLowerCase() === 'customkeys.txt');
+    if (f) write('customkeys.txt', readFileSync(join(g, f)));
+  }
   catalog.files = [...copied].map((p) => p.replace(/\\/g, '/'));
   mkdirSync(out, { recursive: true });
   writeFileSync(join(out, 'catalog.json'), JSON.stringify(catalog, null, 1));

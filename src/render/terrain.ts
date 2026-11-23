@@ -9,6 +9,8 @@ export class TerrainGrid {
   readonly ox: number;
   readonly oy: number;
   readonly cornerHeight: Float32Array;
+  /** Tiles (y * cols + x) covered by a ramp model (HiveWE "romp"); filled by cliffInstances. */
+  readonly romp = new Set<number>();
 
   constructor(readonly t: TerrainData) {
     this.cols = t.columns - 1;
@@ -16,6 +18,18 @@ export class TerrainGrid {
     [this.ox, this.oy] = t.centerOffset;
     this.cornerHeight = new Float32Array(t.columns * t.rows);
     for (let i = 0; i < this.cornerHeight.length; i++) this.cornerHeight[i] = (t.groundHeight[i] + t.layerHeight[i] - 2) * 128;
+    // Ramp entrances: the lower corners of a tile inside a ramp are lifted by half a cliff layer (like HiveWE / the game).
+    for (let y = 0; y < t.rows; y++)
+      for (let x = 0; x < t.columns; x++)
+        for (const [dx, dy] of [[-1, -1], [0, -1], [-1, 0], [0, 0]]) {
+          const tx = x + dx;
+          const ty = y + dy;
+          if (tx < 0 || ty < 0 || tx >= this.cols || ty >= this.rows) continue;
+          const base = Math.min(this.layer(tx, ty), this.layer(tx + 1, ty), this.layer(tx, ty + 1), this.layer(tx + 1, ty + 1));
+          if (this.layer(x, y) !== base || !this.isRampEntrance(tx, ty)) continue;
+          this.cornerHeight[this.idx(x, y)] += 64;
+          break;
+        }
   }
 
   idx(x: number, y: number) {
@@ -32,6 +46,18 @@ export class TerrainGrid {
     return a !== this.layer(x + 1, y) || a !== this.layer(x, y + 1) || a !== this.layer(x + 1, y + 1);
   }
 
+  rampCorner(x: number, y: number) {
+    return (this.t.flags[this.idx(x, y)] & 1) !== 0;
+  }
+
+  /** A tile inside a ramp (all corners flagged, not a flat diagonal) – drawn as ground. */
+  isRampEntrance(x: number, y: number) {
+    if (x < 0 || y < 0 || x >= this.cols || y >= this.rows) return false;
+    const r = (dx: number, dy: number) => this.rampCorner(x + dx, y + dy);
+    if (!(r(0, 0) && r(1, 0) && r(0, 1) && r(1, 1))) return false;
+    return !(this.layer(x, y) === this.layer(x + 1, y + 1) && this.layer(x, y + 1) === this.layer(x + 1, y));
+  }
+
   isRamp(x: number, y: number) {
     const f = this.t.flags;
     let n = 0;
@@ -44,15 +70,23 @@ export class TerrainGrid {
     return c === 15 ? 1 : c;
   }
 
-  /** Ground texture of a corner – cliff neighbours force the cliff's ground tile, like the game. */
+  /**
+   * Ground texture of a corner – cliff and ramp-model neighbours force the cliff's ground tile, like the game
+   * (HiveWE real_tile_texture); a ramp interior keeps its own texture.
+   */
   cornerTexture(x: number, y: number, cliffGroundIndex: (cliff: number) => number, blightIndex: number) {
-    for (let dy = -1; dy < 1; dy++) {
+    const romp = (tx: number, ty: number) => this.romp.has(ty * this.cols + tx);
+    search: for (let dy = -1; dy < 1; dy++) {
       for (let dx = -1; dx < 1; dx++) {
         const cx = x + dx;
         const cy = y + dy;
-        if (cx > 0 && cx < this.cols - 1 && cy > 0 && cy < this.rows - 1 && this.isCliff(cx, cy) && !this.isRamp(cx, cy)) {
-          return cliffGroundIndex(this.cliffTextureAt(cx, cy));
+        if (cx < 0 || cy < 0 || cx >= this.cols || cy >= this.rows) continue;
+        const cliff = this.isCliff(cx, cy);
+        if (cliff) {
+          const allRamp = this.rampCorner(cx, cy) && this.rampCorner(cx + 1, cy) && this.rampCorner(cx, cy + 1) && this.rampCorner(cx + 1, cy + 1);
+          if (allRamp && !romp(cx, cy) && !romp(cx + 1, cy) && !romp(cx, cy + 1) && !romp(cx + 1, cy + 1)) break search;
         }
+        if (cliff || romp(cx, cy)) return cliffGroundIndex(this.cliffTextureAt(cx, cy));
       }
     }
     const i = this.idx(x, y);
@@ -344,7 +378,11 @@ export function buildTerrainMesh(grid: TerrainGrid, opts: TerrainOptions = {}) {
 
 export interface CliffInstance {
   path: string;
-  tile: number;
+  /** Tiles (y * cols + x) the model covers – 1 for cliffs, 2 for ramps. */
+  covers: number[];
+  /** Footprint in tiles (ramps are 1×2 or 2×1). */
+  w: number;
+  h: number;
   tx: number;
   ty: number;
   x: number;
@@ -355,7 +393,8 @@ export interface CliffInstance {
 
 /**
  * Bakes cliff model instances into one mesh per cliff texture. Like the game (and mdx-m3-viewer's cliffs.vert),
- * every vertex is lifted by the bilinear ground height (w3e groundHeight, without layers) of its tile.
+ * every vertex is lifted by the bilinear ground height (w3e groundHeight, without layers) of its tile within the
+ * model footprint.
  */
 export function buildCliffMeshes(grid: TerrainGrid, instances: CliffInstance[], models: Map<string, THREE.BufferGeometry[]>, materials: THREE.Material[]) {
   const t = grid.t;
@@ -366,10 +405,20 @@ export function buildCliffMeshes(grid: TerrainGrid, instances: CliffInstance[], 
     if (!geos) continue;
     let acc = byTexture.get(inst.texture);
     if (!acc) byTexture.set(inst.texture, (acc = { pos: [], nrm: [], uv: [], idx: [] }));
-    const bl = gh(inst.tx, inst.ty);
-    const br = gh(inst.tx + 1, inst.ty);
-    const tl = gh(inst.tx, inst.ty + 1);
-    const tr = gh(inst.tx + 1, inst.ty + 1);
+    const lift = (px: number, py: number) => {
+      // Model space: x from -128 * w (left) to 0 (right), y from 0 (bottom) to 128 * h.
+      const fx = THREE.MathUtils.clamp(inst.w + px / 128, 0, inst.w);
+      const fy = THREE.MathUtils.clamp(py / 128, 0, inst.h);
+      const cx = Math.min(Math.floor(fx), inst.w - 1);
+      const cy = Math.min(Math.floor(fy), inst.h - 1);
+      const sx = fx - cx;
+      const sy = fy - cy;
+      const tx = inst.tx + cx;
+      const ty = inst.ty + cy;
+      const bottom = gh(tx, ty) + (gh(tx + 1, ty) - gh(tx, ty)) * sx;
+      const top = gh(tx, ty + 1) + (gh(tx + 1, ty + 1) - gh(tx, ty + 1)) * sx;
+      return bottom + (top - bottom) * sy;
+    };
     for (const g of geos) {
       const p = g.getAttribute('position');
       const n = g.getAttribute('normal');
@@ -378,11 +427,7 @@ export function buildCliffMeshes(grid: TerrainGrid, instances: CliffInstance[], 
       for (let i = 0; i < p.count; i++) {
         const px = p.getX(i);
         const py = p.getY(i);
-        const fx = THREE.MathUtils.clamp(-px / 128, 0, 1);
-        const fy = THREE.MathUtils.clamp(py / 128, 0, 1);
-        const bottom = br + (bl - br) * fx;
-        const top = tr + (tl - tr) * fx;
-        acc.pos.push(px + inst.x, py + inst.y, p.getZ(i) + inst.z + bottom + (top - bottom) * fy);
+        acc.pos.push(px + inst.x, py + inst.y, p.getZ(i) + inst.z + lift(px, py));
         acc.nrm.push(n.getX(i), n.getY(i), n.getZ(i));
         acc.uv.push(uv ? uv.getX(i) : 0, uv ? uv.getY(i) : 0);
       }
@@ -404,13 +449,63 @@ export function buildCliffMeshes(grid: TerrainGrid, instances: CliffInstance[], 
   return group;
 }
 
-/** Cliff model instances for when original cliff models are available (port of mdx-m3-viewer). */
-export function cliffInstances(grid: TerrainGrid, cliffDirs: string[]) {
+/**
+ * Cliff and ramp model instances for when original models are available (port of mdx-m3-viewer / HiveWE).
+ * Ramps: two tiles long transition models `<RampDir>\<RampDir><BL><TL><TR><BR>0` (corners of the 1?2 / 2?1
+ * footprint, same order as cliffs; verified on the model geometry) where a non-ramp corner is 'A' + layer above the
+ * base and a ramp corner 'L' (low) / 'H' (high); `exists` decides whether the model is available, otherwise the
+ * tile falls back to a cliff. Detection follows HiveWE.
+ */
+export function cliffInstances(grid: TerrainGrid, cliffDirs: string[], rampDirs: string[] = [], exists: (path: string) => boolean = () => true) {
   const out: CliffInstance[] = [];
   const t = grid.t;
+  const L = (x: number, y: number) => grid.layer(x, y);
+  const R = (x: number, y: number) => grid.rampCorner(x, y);
+  const ch = (x: number, y: number, base: number) => String.fromCharCode(R(x, y) ? 76 - (L(x, y) - base) * 4 : 65 + L(x, y) - base);
+  const tile = (x: number, y: number) => y * grid.cols + x;
+  grid.romp.clear();
+  const ramp = (x: number, y: number, name: string, w: number, h: number) => {
+    const texture = grid.cliffTextureAt(x, y);
+    const dir = rampDirs[texture] || (cliffDirs[texture] === 'CityCliffs' ? 'CityCliffTrans' : 'CliffTrans');
+    const path = `Doodads\\Terrain\\${dir}\\${dir}${name}0`;
+    if (!exists(path)) return false;
+    const base = Math.min(L(x, y), L(x + 1, y), L(x, y + 1), L(x + 1, y + 1));
+    const covers = w === 1 ? [tile(x, y), tile(x, y + 1)] : [tile(x, y), tile(x + 1, y)];
+    for (const c of covers) grid.romp.add(c);
+    out.push({ path, covers, w, h, tx: x, ty: y, x: grid.ox + (x + w) * 128, y: grid.oy + y * 128, z: (base - 2) * 128, texture });
+    return true;
+  };
   for (let y = 0; y < grid.rows; y++) {
     for (let x = 0; x < grid.cols; x++) {
-      if (!grid.isCliff(x, y) || grid.isRamp(x, y)) continue;
+      // Vertical ramp (tiles x,y and x,y+1).
+      if (y < grid.rows - 1) {
+        const ae = Math.min(L(x, y), L(x, y + 2));
+        const cf = Math.min(L(x + 1, y), L(x + 1, y + 2));
+        if (L(x, y + 1) === ae && L(x + 1, y + 1) === cf) {
+          const base = Math.min(ae, cf);
+          const left = R(x, y);
+          const right = R(x + 1, y);
+          if (left === R(x, y + 1) && left === R(x, y + 2) && right === R(x + 1, y + 1) && right === R(x + 1, y + 2) && left !== right) {
+            const name = ch(x, y, base) + ch(x, y + 2, base) + ch(x + 1, y + 2, base) + ch(x + 1, y, base);
+            if (ramp(x, y, name, 1, 2)) continue;
+          }
+        }
+      }
+      // Horizontal ramp (tiles x,y and x+1,y).
+      if (x < grid.cols - 1) {
+        const ae = Math.min(L(x, y), L(x + 2, y));
+        const bf = Math.min(L(x, y + 1), L(x + 2, y + 1));
+        if (L(x + 1, y) === ae && L(x + 1, y + 1) === bf) {
+          const base = Math.min(ae, bf);
+          const bottom = R(x, y);
+          const top = R(x, y + 1);
+          if (bottom === R(x + 1, y) && bottom === R(x + 2, y) && top === R(x + 1, y + 1) && top === R(x + 2, y + 1) && bottom !== top) {
+            const name = ch(x, y, base) + ch(x, y + 1, base) + ch(x + 2, y + 1, base) + ch(x + 2, y, base);
+            if (ramp(x, y, name, 2, 1)) continue;
+          }
+        }
+      }
+      if (!grid.isCliff(x, y) || grid.romp.has(tile(x, y)) || grid.isRampEntrance(x, y)) continue;
       const bl = grid.layer(x, y);
       const br = grid.layer(x + 1, y);
       const tl = grid.layer(x, y + 1);
@@ -421,7 +516,7 @@ export function cliffInstances(grid: TerrainGrid, cliffDirs: string[]) {
       const texture = grid.cliffTextureAt(x, y);
       const dir = cliffDirs[texture] ?? 'Cliffs';
       const variation = cliffVariation(dir, name, t.cliffVariation[grid.idx(x, y)]);
-      out.push({ path: `Doodads\\Terrain\\${dir}\\${dir}${name}${variation}`, tile: y * grid.cols + x, tx: x, ty: y, x: grid.ox + (x + 1) * 128, y: grid.oy + y * 128, z: (base - 2) * 128, texture });
+      out.push({ path: `Doodads\\Terrain\\${dir}\\${dir}${name}${variation}`, covers: [tile(x, y)], w: 1, h: 1, tx: x, ty: y, x: grid.ox + (x + 1) * 128, y: grid.oy + y * 128, z: (base - 2) * 128, texture });
     }
   }
   return out;

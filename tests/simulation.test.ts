@@ -162,6 +162,48 @@ describe('construction', () => {
     const path = rectCenter(game, game.cfg.path[1]);
     expect(game.build(b, 'h001', path.x, path.y)).toBe(ERR.cantPlace);
   });
+
+  it('a second builder speeds up construction (Power Build) for a fee', () => {
+    const progress = (helpers: number) => {
+      const game = newGame();
+      run(game, 3);
+      const b = builder(game);
+      game.players[0].gold = 1000;
+      const [x, y] = freeSite(game, 300);
+      expect(game.build(b, 'h001', x, y)).toBeNull();
+      for (let i = 0; i < 200 && !b.constructs; i++) run(game, 0.1);
+      const site = b.constructs!;
+      for (let i = 0; i < helpers; i++) {
+        const h = game.createUnit(b.def.id, 0, b.x + 20 * (i + 1), b.y, 0);
+        expect(game.orderRepair(h, site)).toBeNull();
+      }
+      // Let the helper walk to the site, then measure a short stretch of the build.
+      for (let i = 0; i < 40 && game.units.filter((u) => u.constructs === site && u.anim === 'work').length < helpers + 1; i++) run(game, 0.05);
+      const gold = game.players[0].gold;
+      const start = site.constructing!.elapsed;
+      run(game, 1);
+      return { done: site.constructing!.elapsed - start, paid: gold - game.players[0].gold };
+    };
+    const alone = progress(0);
+    const helped = progress(1);
+    expect(helped.done / alone.done).toBeCloseTo(1.6, 1);
+    expect(alone.paid).toBe(0);
+    expect(helped.paid).toBeGreaterThanOrEqual(0);
+  });
+
+  it('repair restores a damaged building and costs gold', () => {
+    const game = newGame();
+    run(game, 3);
+    const b = builder(game);
+    const tower = buildTower(game);
+    tower.hp = tower.maxHp * 0.3;
+    game.players[0].gold = 1000;
+    expect(game.orderRepair(b, tower)).toBeNull();
+    for (let i = 0; i < 400 && tower.hp < tower.maxHp; i++) run(game, 0.25);
+    expect(tower.hp).toBe(tower.maxHp);
+    expect(game.players[0].gold).toBeLessThan(1000);
+    expect(game.orderRepair(b, tower)).toBe(ERR.notDamaged);
+  });
 });
 
 describe('waves', () => {
@@ -231,6 +273,121 @@ describe('towers', () => {
     const hp = c.hp;
     run(game, 5);
     expect(c.hp).toBeLessThan(hp);
+  });
+});
+
+describe('defenders', () => {
+  /** A defender on a free spot and one standing creep on its way to a destination well beyond the acquisition range. */
+  const setup = () => {
+    const game = startWave();
+    const sg = game.units.find((u) => u.kind === 'spawning' && u.owner === 0)!;
+    const id = sg.def.trains.find((t) => game.db.unit(t).attack && game.db.unit(t).speed > 0)!;
+    const [x, y] = freeSite(game, 400);
+    const d = game.createUnit(id, 0, x, y, 0);
+    const [c, ...rest] = creeps(game);
+    for (const o of rest) kill(game, o, null);
+    const reach = d.def.attack!.acquire + d.def.attack!.range;
+    c.path = null;
+    c.x = x + 500;
+    c.y = y;
+    return { game, d, c, dest: { x: x + 500 + reach + 300, y } };
+  };
+
+  it('a move order walks past enemies without fighting', () => {
+    const { game, d, c, dest } = setup();
+    const hp = c.hp;
+    game.orderMove(d, dest.x, dest.y);
+    for (let i = 0; i < 200 && d.moveTarget; i++) run(game, 0.25);
+    expect(d.moveTarget).toBeNull();
+    expect(c.hp).toBe(hp);
+  });
+
+  it('an attack-move fights enemies met on the way and then continues', () => {
+    const { game, d, c, dest } = setup();
+    const hp = c.hp;
+    game.orderAttackMove(d, dest.x, dest.y);
+    for (let i = 0; i < 400 && d.attackMove; i++) run(game, 0.25);
+    expect(c.hp).toBeLessThan(hp);
+    expect(d.attackMove).toBeNull();
+    expect(Math.hypot(d.x - dest.x, d.y - dest.y)).toBeLessThan(64);
+  });
+  it('units do not overlap and two units sent to one point both stop', () => {
+    const { game, d } = setup();
+    for (const c of creeps(game)) kill(game, c, null);
+    const e = game.createUnit(d.def.id, 0, d.x, d.y, 0);
+    run(game, 1);
+    const min = (Number(d.def.fields.ucol) || 16) * 2;
+    expect(Math.hypot(d.x - e.x, d.y - e.y)).toBeGreaterThan(min * 0.9);
+    game.orderMove(d, d.x - 300, d.y);
+    game.orderMove(e, d.x - 300, d.y);
+    run(game, 8);
+    expect(d.path).toBeNull();
+    expect(e.path).toBeNull();
+    expect(Math.hypot(d.x - e.x, d.y - e.y)).toBeGreaterThan(min * 0.9);
+  });
+});
+
+describe('creep spells', () => {
+  it('a Shaman casts Bloodlust on a fighting ally at its cast point, not on idle ones', () => {
+    const game = startWave();
+    for (const c of creeps(game)) kill(game, c, null);
+    run(game, 2);
+    const [x, y] = freeSite(game, 400);
+    const shaman = game.createUnit('n007', CREEP_PLAYER, x, y, 0);
+    const idle = game.createUnit(game.cfg.waves[0].unit, CREEP_PLAYER, x + 80, y, 0);
+    const fighter = game.createUnit(game.cfg.waves[0].unit, CREEP_PLAYER, x - 80, y, 0);
+    for (const u of [shaman, idle, fighter]) u.path = null;
+    // Keep the allies in place (stunned units do not walk or attack the gate).
+    idle.stunUntil = fighter.stunUntil = Infinity;
+    fighter.lastDamaged = game.time;
+    run(game, 0.1);
+    expect(shaman.anim).toBe('spell');
+    const cast = shaman.casting;
+    expect(cast).not.toBeNull();
+    expect(Object.keys(fighter.buffs)).toHaveLength(0);
+    run(game, Number(shaman.def.fields.ucpt ?? 0.3));
+    expect(Object.keys(fighter.buffs)).toHaveLength(1);
+    expect(Object.keys(idle.buffs)).toHaveLength(0);
+    run(game, Number(shaman.def.fields.ucbs ?? 0.51));
+    expect(shaman.casting).not.toBe(cast);
+  });
+});
+
+describe('saved games', () => {
+  it('a game loaded from a save continues exactly like the original', () => {
+    const game = startWave(3);
+    buildTower(game);
+    run(game, 7);
+    const data = JSON.parse(JSON.stringify(game.save()));
+    const loaded = newGame(99);
+    loaded.load(data);
+    expect(loaded.units.map((u) => u.uid)).toEqual(game.units.map((u) => u.uid));
+    for (const g of [game, loaded]) run(g, 60);
+    const state = (g: Game) => ({
+      wave: g.wave,
+      lives: g.lives,
+      gold: g.players[0].gold,
+      kills: g.players[0].kills,
+      units: g.units.filter((u) => u.alive).map((u) => [u.uid, u.def.id, Math.round(u.x), Math.round(u.y), Math.round(u.hp)]),
+    });
+    expect(state(loaded)).toEqual(state(game));
+    expect(loaded.players[0].kills).toBeGreaterThan(0);
+  });
+});
+
+describe('shop', () => {
+  it('sells only to a player with a unit near the shop', () => {
+    const game = newGame();
+    run(game, 3);
+    const shop = game.units.find((u) => u.kind === 'shop')!;
+    const id = shop.def.sells[0];
+    game.players[0].gold = 1000;
+    for (const u of game.units) if (u.owner === 0 && u.speed > 0 && Math.hypot(u.x - shop.x, u.y - shop.y) <= 450) u.x += 5000;
+    expect(game.buy(0, id)).toBe(ERR.noShopper);
+    const b = builder(game);
+    b.x = shop.x + 200;
+    b.y = shop.y;
+    expect(game.buy(0, id)).toBeNull();
   });
 });
 

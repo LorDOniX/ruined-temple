@@ -13,7 +13,8 @@ import { PortraitView } from './render/portrait';
 import { plainText, wc3ToHtml } from './data/objects';
 import { SoundPlayer } from './sound';
 import { GameCursor, type CursorTint } from './ui/cursor';
-import { GameMenu } from './ui/menu';
+import { GameMenu, decodeKeysFile, savedSettings } from './ui/menu';
+import { takePendingLoad } from './ui/saves';
 import { DayNight } from './render/daynight';
 
 async function loadJson<T>(url: string): Promise<T | null> {
@@ -80,6 +81,7 @@ async function main() {
   }
   const catalog = await loadJson<AssetCatalog>('war3/catalog.json');
   const assets = catalog ? new Wc3Assets(catalog) : null;
+  if (assets && savedSettings().textures === 'low') assets.textureLevel = 1;
   void loadingScreen(map, assets);
   const db = new ObjectDB(map, catalog);
   const grid = new TerrainGrid(map.terrain);
@@ -87,7 +89,8 @@ async function main() {
   // --- renderer & scene ----------------------------------------------------------------------------
   const canvas = document.getElementById('view') as HTMLCanvasElement;
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
-  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  let renderScale = 1;
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2) * renderScale);
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x000000);
@@ -114,10 +117,11 @@ async function main() {
   let cliffs: CliffInstance[] = [];
   if (assets && catalog) {
     const dirs = map.terrain.cliffTilesets.map((id) => catalog.cliffs[id]?.modelDir ?? 'Cliffs');
-    cliffs = cliffInstances(grid, dirs).filter((c) => assets.modelExists(c.path));
+    const rampDirs = map.terrain.cliffTilesets.map((id) => catalog.cliffs[id]?.rampDir ?? '');
+    cliffs = cliffInstances(grid, dirs, rampDirs, (p) => assets.modelExists(p)).filter((c) => assets.modelExists(c.path));
   }
   stage('Stavím terén…');
-  const terrain = buildTerrainMesh(grid, { groundLayers, cliffLayers, cliffGroundTiles, shadows, layerSize, cliffModelTiles: new Set(cliffs.map((c) => c.tile)) });
+  const terrain = buildTerrainMesh(grid, { groundLayers, cliffLayers, cliffGroundTiles, shadows, layerSize, cliffModelTiles: new Set(cliffs.flatMap((c) => c.covers)) });
 
   const game = new Game(map, db, (x, y) => grid.heightAt(x, y), 1);
   game.cat = catalog;
@@ -161,7 +165,7 @@ async function main() {
 
   // --- sounds ---------------------------------------------------------------------------------------------
   const sound = new SoundPlayer(assets);
-  sound.listener = () => ({ x: cam.target.x, y: cam.target.y });
+  sound.listener = () => ({ x: cam.target.x, y: cam.target.y, zoom: cam.distance });
   view.sound = sound;
   game.on('sound', (s) => sound.play(s.file, s.volume, s.pitch));
   // Interface sounds (UI\SoundInfo\UISounds.slk) of the local player's race.
@@ -196,7 +200,20 @@ async function main() {
   };
   // war3map.j main(): SetMapMusic("Music", true, 0) → race playlist from UI\war3skins.txt.
   if (catalog?.music) sound.startMusic(catalog.music);
-  new GameMenu(game, hud, sound, cam);
+  // war3map.j main(): SetAmbientDaySound / SetAmbientNightSound (MIDI + DLS ambience of Sunken Ruins).
+  void sound.loadAmbient(catalog?.ambient);
+  new GameMenu(game, hud, sound, cam, {
+    setParticles: (max) => {
+      view.particles.maxQuality = max;
+      view.particles.quality = Math.min(view.particles.quality, max);
+    },
+    setResolution: (scale) => {
+      renderScale = scale;
+      renderer.setPixelRatio(Math.min(devicePixelRatio, 2) * scale);
+      resize();
+    },
+    setShadows: (on) => (view.showShadows = on),
+  }, assets?.has('CustomKeys.txt') ? () => fetch(assets.url('CustomKeys.txt')).then(async (r) => (r.ok ? decodeKeysFile(await r.arrayBuffer()) : null)).catch(() => null) : null);
 
   stage('Rozmisťuji doodady a jednotky…');
   await view.buildStatic();
@@ -204,7 +221,22 @@ async function main() {
   view.buildDestructables();
   const myBuilder = game.units.find((u) => u.kind === 'builder' && u.owner === 0);
   if (myBuilder) cam.panTo(myBuilder.x, myBuilder.y);
+  // A saved game chosen in "Nahrát hru" (the page reloads, the fresh game is replaced by the save).
+  const pending = takePendingLoad();
+  if (pending) {
+    try {
+      game.load(pending.data);
+      cam.panTo(pending.camera.x, pending.camera.y);
+      hud.addMessage('Hra byla nahrána.', 4);
+    } catch (e) {
+      console.error(e);
+      hud.addMessage(`|cffff4040Uloženou hru nelze nahrát: ${(e as Error).message}|r`, 8);
+    }
+  }
   hud.onMinimapClick = (x, y) => cam.panTo(x, y);
+  hud.onPing = () => sound.playLabel('MapPing');
+  hud.onAllyColors = (on) => view.setAllyColors(on);
+  view.localPlayer = hud.localPlayer;
   // Selection: the first unit is the "primary" one shown in the info panel / command card.
   let group: Unit[] = [];
   let selected: Unit | null = null;
@@ -216,6 +248,7 @@ async function main() {
     hud.submenu = null;
   };
   const select = (u: Unit | null) => setSelection(u ? [u] : []);
+  hud.onSubgroup = (units) => setSelection(units);
   hud.onSelect = (u) => {
     select(u);
     ackSelect(u);
@@ -383,20 +416,38 @@ async function main() {
   addEventListener('mouseup', (e) => {
     if (e.button === 0) finishSelection(e);
   });
-  /** Group move: spread the units in a small grid around the target point so they don't stack. */
-  const groupMove = (units: Unit[], x: number, y: number) => {
+  /**
+   * Group move: spread the units in a small grid around the target point so they don't stack. With formation
+   * movement on (minimap button / Alt+F) the group keeps its current shape around the target instead.
+   */
+  const groupMove = (units: Unit[], x: number, y: number, attack = false) => {
     const movers = units.filter((u) => u.alive && u.owner === hud.localPlayer && u.speed > 0);
+    const order = (u: Unit, tx: number, ty: number) => (attack ? game.orderAttackMove(u, tx, ty) : game.orderMove(u, tx, ty));
+    if (hud.minimapOpts.formation && movers.length > 1) {
+      const cx = movers.reduce((a, u) => a + u.x, 0) / movers.length;
+      const cy = movers.reduce((a, u) => a + u.y, 0) / movers.length;
+      const spread = Math.max(...movers.map((u) => Math.hypot(u.x - cx, u.y - cy)));
+      const k = spread > 400 ? 400 / spread : 1;
+      for (const u of movers) order(u, x + (u.x - cx) * k, y + (u.y - cy) * k);
+      return movers.length;
+    }
     const cols = Math.ceil(Math.sqrt(movers.length));
     movers.forEach((u, i) => {
       const ox = movers.length > 1 ? ((i % cols) - (cols - 1) / 2) * 70 : 0;
       const oy = movers.length > 1 ? (Math.floor(i / cols) - (cols - 1) / 2) * 70 : 0;
-      game.orderMove(u, x + ox, y + oy);
+      order(u, x + ox, y + oy);
     });
     return movers.length;
   };
   canvas.addEventListener('mousedown', (e) => {
     const [mx, my] = mousePos(e);
     if (e.button === 0) {
+      if (hud.mode.kind === 'ping') {
+        const pt = groundPoint(mx, my);
+        if (pt) hud.ping(pt.x, pt.y);
+        hud.mode = { kind: 'normal' };
+        return;
+      }
       if (hud.mode.kind === 'build') {
         const pt = groundPoint(mx, my);
         if (pt && selected) {
@@ -429,6 +480,17 @@ async function main() {
             hud.report(err);
             if (!err) ack(selected, 'YesAttack');
           }
+        } else if (hud.mode.ability === 'repair') {
+          const builders = group.filter((u) => u.alive && u.kind === 'builder' && mine(u));
+          if (target && builders.length) {
+            let err: string | null = null;
+            for (const b of builders) err = game.orderRepair(b, target) ?? err;
+            hud.report(err);
+            if (!err) {
+              view.orderConfirmation(target.x, target.y, 'move', true);
+              ack(builders[0], 'Yes');
+            }
+          } else hud.report(ERR.targetRepair);
         } else if (hud.mode.ability === 'coin') {
           if (target && target.owner === CREEP_PLAYER) {
             const err = game.coinBash(selected, target);
@@ -448,8 +510,9 @@ async function main() {
             view.orderConfirmation(target.x, target.y, 'attack', true);
             ack(own.find((u) => u.def.attack), 'YesAttack');
           } else {
+            // Attack-move: walk there and fight every enemy met on the way.
             const pt = groundPoint(mx, my);
-            if (pt && groupMove(own, pt.x, pt.y)) {
+            if (pt && groupMove(own, pt.x, pt.y, true)) {
               view.orderConfirmation(pt.x, pt.y, 'attack');
               ack(selected, 'YesAttack');
             }
@@ -498,6 +561,7 @@ async function main() {
     const [ex, ey] = cam.edge;
     const hover = overCanvas ? hoverUnit : null;
     if (ex || ey) cursor.set('Scroll', 'none', [ex, ey]);
+    else if (hud.mode.kind === 'ping') cursor.set('Target');
     else if (hud.mode.kind === 'target') cursor.set(hover ? 'TargetSelect' : 'Target', hover ? allegiance(hover) : 'none');
     else if (hover && !drag?.active && hud.mode.kind === 'normal') cursor.set('Select');
     else cursor.set('Normal');
@@ -517,6 +581,8 @@ async function main() {
   };
   const mul = (out: THREE.Color, b: THREE.Color, f: number[]) => out.setRGB(b.r * f[0], b.g * f[1], b.b * f[2]);
   const updateLighting = () => {
+    sound.setTimeOfDay((8 + (game.time * 24) / 480) % 24);
+    sound.update();
     if (!dayNight) return;
     // Same clock as the console: the game day lasts 8 minutes and starts at 8:00.
     const f = dayNight.factors((8 + (game.time * 24) / 480) % 24);
@@ -541,7 +607,7 @@ async function main() {
   let avgDt = 1 / 60;
   const frame = (dt: number) => {
     avgDt = avgDt * 0.95 + dt * 0.05;
-    view.particles.quality = Math.max(0.25, Math.min(1, view.particles.quality * (avgDt > 1 / 30 ? 0.995 : avgDt < 1 / 50 ? 1.01 : 1)));
+    view.particles.quality = Math.max(0.25, Math.min(view.particles.maxQuality, view.particles.quality * (avgDt > 1 / 30 ? 0.995 : avgDt < 1 / 50 ? 1.01 : 1)));
     game.update(dt);
     cam.update(dt);
     // Dead / removed units drop out of the selection (a dying creep stays selected until removed, as in WC3).
@@ -549,13 +615,19 @@ async function main() {
       setSelection(group.filter((u) => game.units.includes(u) && (u.alive || u.owner === CREEP_PLAYER)));
     }
     if (hud.mode.kind !== 'build') view.showGhost(null);
+    const corners = frustumCorners();
+    if (view.decals) {
+      // Ground decals only for the visible ground (+ margin); without all four corners (looking at the horizon) all of them.
+      const m = 512;
+      view.decals.viewRect = corners.length === 4 ? { minX: Math.min(...corners.map((p) => p.x)) - m, minY: Math.min(...corners.map((p) => p.y)) - m, maxX: Math.max(...corners.map((p) => p.x)) + m, maxY: Math.max(...corners.map((p) => p.y)) + m } : null;
+    }
     view.update(dt, cam.camera, canvas.clientWidth, canvas.clientHeight);
     updateCursor(dt);
     updateLighting();
     hud.update(selected);
     portrait.setUnit(selected && (selected.alive || selected.owner === CREEP_PLAYER) ? selected : null);
     portrait.update(game.paused ? 0 : dt);
-    hud.drawMinimap(frustumCorners());
+    hud.drawMinimap(corners);
     if (pathingOn && (pathingTimer += dt) > 0.5) {
       pathingTimer = 0;
       refreshPathing();
@@ -572,7 +644,7 @@ async function main() {
   requestAnimationFrame(loop);
 
   // Handy for debugging from the console (frame() advances one tick even when the tab is hidden).
-  Object.assign(window as object, { game, view, cam, db, map, hud, frame, portrait });
+  Object.assign(window as object, { game, view, cam, db, map, hud, frame, portrait, sound, assets, grid, renderer, scene });
 }
 
 main().catch((e) => {

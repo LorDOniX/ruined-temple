@@ -4,6 +4,44 @@ import { PathingGrid } from './pathing';
 import { armorMultiplier, attackMultiplier, randomInt, rollDamage } from './combat';
 
 type Thread = Generator<number, void, void>;
+/**
+ * Resumable trigger thread: the generator keeps its progress in this plain object (pc = completed sleeps, loop
+ * counters), so a saved game can recreate the generator and continue after the last TriggerSleepAction.
+ */
+/** Saved game (Game.save / Game.load) – plain JSON. */
+export interface SaveData {
+  version: 1;
+  scalars: Record<string, unknown>;
+  players: PlayerState[];
+  goldDebt: number[];
+  shopStock: Game['shopStock'];
+  destructables: Record<string, Destructable>;
+  named: Record<string, number>;
+  units: (Omit<Unit, 'def' | 'target' | 'forcedTarget' | 'chase' | 'constructs' | 'repairs' | 'drain' | 'poison' | 'casting' | 'rects'> & {
+    def: string;
+    target: number | null;
+    forcedTarget: number | null;
+    chase: number | null;
+    constructs: number | null;
+    repairs: number | null;
+    drain: (Omit<NonNullable<Unit['drain']>, 'target'> & { target: number }) | null;
+    poison: (Omit<NonNullable<Unit['poison']>, 'source'> & { source: number | null }) | null;
+    casting: null;
+    rects: string[];
+  })[];
+  missiles: (Omit<Missile, 'source' | 'target' | 'bounce'> & { source: number; target: number | null; bounce: (Omit<NonNullable<Missile['bounce']>, 'hit'> & { hit: number[] }) | null })[];
+  storms: (Omit<Game['storms'][number], 'source'> & { source: number })[];
+  pendingShots: { u: number; t: number; at: number }[];
+  threads: { state: ThreadState; at: number; seq: number }[];
+  /** Pathing occupancy as runs: start, length, value. */
+  occupied: number[];
+}
+
+export interface ThreadState {
+  kind: 'init' | 'quests' | 'slowSelector' | 'startingGame' | 'waveSpawn' | 'waveClear' | 'victory' | 'lifeLost';
+  pc: number;
+  i?: number;
+}
 
 export type UnitKind = 'creep' | 'tower' | 'builder' | 'defender' | 'spawning' | 'shop' | 'other';
 
@@ -42,6 +80,8 @@ export interface Unit {
   buildQueue: { id: string; x: number; y: number }[];
   /** Builder: the unfinished building it works on – construction only progresses while it stands there. */
   constructs: Unit | null;
+  /** Unit / building this builder repairs (Ahrp). */
+  repairs: Unit | null;
   /** Mana (unit fields umpi initial, umpm maximum, umpr regeneration per second). */
   mana: number;
   maxMana: number;
@@ -57,15 +97,19 @@ export interface Unit {
   /** Target the unit walks to (auto-acquired within acquisition range or ordered); path refresh time. */
   chase: Unit | null;
   chaseRepath: number;
+  /** Attack-move destination: the unit walks there, engaging enemies it meets on the way (null = plain move). */
+  attackMove: { x: number; y: number } | null;
   /** Channelled Mana Drain. */
   drain: { target: Unit; until: number; rate: number; range: number; ability: string } | null;
+  /** A spell being cast: the effect happens at the cast point (ucpt), the unit stays busy until the backswing (ucbs) ends. */
+  casting: { fireAt: number; until: number; apply: (() => void) | null } | null;
   upgrading: { to: string; total: number; elapsed: number } | null;
   queue: { kind: 'train' | 'research'; id: string; level: number; total: number; elapsed: number }[];
   userData: number;
   rects: Set<string>;
   kills: number;
   /** Visual animation hint for the renderer. */
-  anim: 'stand' | 'walk' | 'attack' | 'death' | 'birth' | 'work';
+  anim: 'stand' | 'walk' | 'attack' | 'death' | 'birth' | 'work' | 'spell';
   animTime: number;
   removeAt: number;
   footprint: number;
@@ -124,6 +168,22 @@ export interface PlayerState {
   /** Score screen: gold from bounties and wave bonuses, buildings founded. */
   earned: number;
   built: number;
+  /** Units trained, shop purchases, largest army (own mobile units at once). */
+  trained: number;
+  bought: number;
+  largestArmy: number;
+  /** Sum of point values (upoi) of produced units / buildings and of killed enemies – the unit score. */
+  producedValue: number;
+  killValue: number;
+  /** Score over time for the score screen graph (every 10 s of game time). */
+  history: ScoreSample[];
+}
+
+export interface ScoreSample {
+  t: number;
+  units: number;
+  resources: number;
+  total: number;
 }
 
 type Events = {
@@ -145,9 +205,9 @@ type Events = {
   /** A buff was applied to / removed from a unit (its art is attached to the model). */
   buff: { unit: Unit; id: string; on: boolean };
   /** One-shot spell art at a place (caster / target / effect art of an ability or buff). */
-  spellArt: { model: string; x: number; y: number; unit?: Unit; sound?: string };
+  spellArt: { model: string; x: number; y: number; unit?: Unit; sound?: string; duration?: number };
   /** Lasting lightning between two units (Mana Drain), until `until` (game time) or `link` set to null. */
-  link: { id: number; from: Unit; to: Unit; lightning: string; until: number };
+  link: { id: number; from: Unit; to: Unit; lightning: string; until: number; sound?: string };
   /** Error of an order that failed later (shown like a HUD error to its owner). */
   error: { owner: number; text: string };
   /** Construction or upgrade finished (engine message "Dokončeno: …"). */
@@ -182,6 +242,9 @@ export const ERR = {
   busy: 'Budova je zaneprázdněná.',
   queueFull: 'Fronta je plná.',
   researched: 'Již vyzkoumáno.',
+  targetRepair: 'Cílem musí být budova nebo mechanická jednotka.', // Targetrepair
+  notDamaged: 'Cíl není poškozen.', // RepairHPmaxed
+  noShopper: 'Žádná vaše jednotka není poblíž obchodu.',
 };
 export const CREEP_PLAYER = 3;
 /** Numeric object field ('-' / '' / missing = 0). */
@@ -219,6 +282,7 @@ export class Game {
   readonly rects: GameConfig['regions'];
   private uidSeq = 1;
   private missileSeq = 1;
+  private nextAuraRefresh = 0;
   /** Attacks between the start of the swing and their damage point. */
   /** Skyfury storms in progress. */
   storms: { x: number; y: number; owner: number; source: Unit; until: number; next: number; interval: number; damage: number; radius: number; buff: string }[] = [];
@@ -226,12 +290,20 @@ export class Game {
   cat: AssetCatalog | null = null;
   private pendingShots: { u: Unit; t: Unit; at: number; auras: ReturnType<Game['auraSources']> }[] = [];
   /** Trigger "threads": generators that yield the number of seconds to sleep (TriggerSleepAction). */
-  private threads: { gen: Thread; at: number; seq: number }[] = [];
+  private threads: { gen: Thread; state: ThreadState; at: number; seq: number }[] = [];
   private threadSeq = 0;
   private listeners: { [K in keyof Events]?: ((e: Events[K]) => void)[] } = {};
   private ancestors = new Map<string, Set<string>>();
   private difficultyChosen = false;
-  private rnd: () => number = Math.random;
+  /** Seeded generator state (mulberry32); null = Math.random. Kept as a number so saved games continue the sequence. */
+  private rndState: number | null = null;
+  private rnd = (): number => {
+    if (this.rndState === null) return Math.random();
+    const a = (this.rndState = (this.rndState + 0x6d2b79f5) | 0);
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
   readonly heightAt: (x: number, y: number) => number;
   /** Variables of pre-placed units (gg_unit_*). */
   readonly named: Record<string, Unit> = {};
@@ -255,9 +327,39 @@ export class Game {
   }
 
   /** TriggerExecute: runs the thread synchronously until its first sleep, then schedules it in game time. */
-  private run(gen: Thread) {
+  private run(kind: ThreadState['kind'], u?: Unit) {
+    const state: ThreadState = { kind, pc: 0 };
+    const gen = this.threadGen(state, u);
     const r = gen.next();
-    if (!r.done) this.threads.push({ gen, at: this.time + Math.max(0, r.value), seq: this.threadSeq++ });
+    if (!r.done) this.threads.push({ gen, state, at: this.time + Math.max(0, r.value), seq: this.threadSeq++ });
+  }
+
+  private threadGen(s: ThreadState, u?: Unit): Thread {
+    switch (s.kind) {
+      case 'init':
+        return this.trigIntialization(s);
+      case 'quests':
+        return this.trigQuests(s);
+      case 'slowSelector':
+        return this.trigSlowSelector(s);
+      case 'startingGame':
+        return this.trigStartingGame(s);
+      case 'waveSpawn':
+        return this.trigWaveSpawn(s);
+      case 'waveClear':
+        return this.trigWaveClear(s);
+      case 'victory':
+        return this.trigVictory(s);
+      case 'lifeLost':
+        return this.lifeLost(s, u);
+    }
+  }
+
+  /** Spawn portal doodad (D004): "birth" opens it while a wave spawns, "death" closes it. */
+  portalOpen = false;
+  private portal(anim: 'birth' | 'death') {
+    this.portalOpen = anim === 'birth';
+    this.emit('doodadAnim', { id: 'D004', anim });
   }
 
   private resumeThreads() {
@@ -267,7 +369,7 @@ export class Game {
       if (!next) return;
       this.threads.splice(this.threads.indexOf(next), 1);
       const r = next.gen.next();
-      if (!r.done) this.threads.push({ gen: next.gen, at: Math.max(this.time, next.at + Math.max(0, r.value)), seq: this.threadSeq++ });
+      if (!r.done) this.threads.push({ gen: next.gen, state: next.state, at: Math.max(this.time, next.at + Math.max(0, r.value)), seq: this.threadSeq++ });
     }
   }
 
@@ -292,7 +394,7 @@ export class Game {
 
   start() {
     for (let i = 0; i < 3; i++) {
-      this.players.push({ id: i, name: PLAYER_NAMES[i], color: PLAYER_COLORS[i], playing: i < this.humanPlayers, gold: 0, kills: 0, research: {}, earned: 0, built: 0 });
+      this.players.push({ id: i, name: PLAYER_NAMES[i], color: PLAYER_COLORS[i], playing: i < this.humanPlayers, gold: 0, kills: 0, research: {}, earned: 0, built: 0, trained: 0, bought: 0, largestArmy: 0, producedValue: 0, killValue: 0, history: [] });
     }
     for (const d of this.cfg.destructables) {
       const hp = this.db.destructableLife(d.id);
@@ -317,7 +419,7 @@ export class Game {
         this.shopStock[id] = { stock: max, max, regen: Number(f.usrg ?? 60), nextAt: 0 };
       }
     }
-    this.run(this.trigIntialization());
+    this.run('init');
   }
 
   private setGatePathing(d: Destructable, block: boolean) {
@@ -382,6 +484,7 @@ export class Game {
       constructing: null,
       buildQueue: [],
       constructs: null,
+      repairs: null,
       mana: num(def.fields.umpi),
       maxMana: num(def.fields.umpm),
       manaRegen: num(def.fields.umpr),
@@ -391,7 +494,9 @@ export class Game {
       holdPosition: false,
       chase: null,
       chaseRepath: 0,
+      attackMove: null,
       drain: null,
+      casting: null,
       upgrading: null,
       queue: [],
       userData: 0,
@@ -420,27 +525,42 @@ export class Game {
   // Triggers (ported from war3map.j)
   // ---------------------------------------------------------------------------------------------
 
-  private *trigIntialization(): Thread {
-    this.emit('fade', { dir: 'out', duration: 0 });
-    this.playerCount = this.players.filter((p) => p.playing).length;
-    yield 0.5;
-    for (const p of this.players) if (p.playing) p.gold = this.cfg.startGold;
-    for (const [i, name] of ['gg_unit_h002_0007', 'gg_unit_h002_0002', 'gg_unit_h002_0009'].entries()) {
-      const b = this.named[name];
-      if (b && !this.players[i].playing) b.hidden = true;
+  private *trigIntialization(s: ThreadState): Thread {
+    if (s.pc < 1) {
+      this.emit('fade', { dir: 'out', duration: 0 });
+      this.playerCount = this.players.filter((p) => p.playing).length;
+      s.pc = 1;
+      yield 0.5;
     }
-    yield 0.5;
-    for (const d of Object.values(this.destructables)) if (d.id === 'ZTg1') d.invulnerable = true;
-    this.emit('doodadAnim', { id: 'D004', anim: 'death' });
-    yield 0.5;
-    this.lives = this.cfg.livesPerPlayer * this.playerCount;
-    yield 0.5;
+    if (s.pc < 2) {
+      for (const p of this.players) if (p.playing) p.gold = this.cfg.startGold;
+      for (const [i, name] of ['gg_unit_h002_0007', 'gg_unit_h002_0002', 'gg_unit_h002_0009'].entries()) {
+        const b = this.named[name];
+        if (b && !this.players[i].playing) b.hidden = true;
+      }
+      s.pc = 2;
+      yield 0.5;
+    }
+    if (s.pc < 3) {
+      for (const d of Object.values(this.destructables)) if (d.id === 'ZTg1') d.invulnerable = true;
+      this.portal('death');
+      s.pc = 3;
+      yield 0.5;
+    }
+    if (s.pc < 4) {
+      this.lives = this.cfg.livesPerPlayer * this.playerCount;
+      s.pc = 4;
+      yield 0.5;
+    }
     this.trigDialogButton();
-    this.run(this.trigQuests());
+    this.run('quests');
   }
 
-  private *trigQuests(): Thread {
-    yield 2;
+  private *trigQuests(s: ThreadState): Thread {
+    if (s.pc < 1) {
+      s.pc = 1;
+      yield 2;
+    }
     this.emit('quest', undefined);
   }
 
@@ -452,11 +572,14 @@ export class Game {
       timeout: this.cfg.difficultyTimeout,
     });
     for (const p of this.players) if (p.playing && p !== host) this.message(`${host.name} is selecting difficulty...`, 10);
-    this.run(this.trigSlowSelector());
+    this.run('slowSelector');
   }
 
-  private *trigSlowSelector(): Thread {
-    yield this.cfg.difficultyTimeout;
+  private *trigSlowSelector(s: ThreadState): Thread {
+    if (s.pc < 1) {
+      s.pc = 1;
+      yield this.cfg.difficultyTimeout;
+    }
     if (!this.difficultyChosen) {
       this.difficultyChosen = true;
       this.setDifficulty(this.cfg.defaultDifficulty, this.str('TRIGSTR_558'));
@@ -476,29 +599,38 @@ export class Game {
     this.handicap = this.difficultyFactor * this.playerCount;
     this.emit('dialog', null);
     this.message(msg, 3);
-    this.run(this.trigStartingGame());
+    this.run('startingGame');
   }
 
-  private *trigStartingGame(): Thread {
-    this.multiboardTitle = this.str('TRIGSTR_326');
-    this.emit('fade', { dir: 'in', duration: 3 });
-    yield 3;
+  private *trigStartingGame(s: ThreadState): Thread {
+    if (s.pc < 1) {
+      this.multiboardTitle = this.str('TRIGSTR_326');
+      this.emit('fade', { dir: 'in', duration: 3 });
+      s.pc = 1;
+      yield 3;
+    }
+    if (s.pc < 2) {
+      this.emit('clearMessages', undefined);
+      this.message('TRIGSTR_559');
+      this.playSound('gg_snd_GoodJob');
+      this.multiboardVisible = true;
+      s.pc = 2;
+      yield 8;
+    }
+    if (s.pc < 3) {
+      this.emit('clearMessages', undefined);
+      this.message('TRIGSTR_560');
+      this.playSound('gg_snd_Hint');
+      const w = this.cfg.waves[0];
+      this.spawnUnit = w.unit;
+      this.spawnName = w.name;
+      this.spawnCooldown = w.spawnCooldown;
+      this.waveSound = w.sound;
+      s.pc = 3;
+      yield 8;
+    }
     this.emit('clearMessages', undefined);
-    this.message('TRIGSTR_559');
-    this.playSound('gg_snd_GoodJob');
-    this.multiboardVisible = true;
-    yield 8;
-    this.emit('clearMessages', undefined);
-    this.message('TRIGSTR_560');
-    this.playSound('gg_snd_Hint');
-    const w = this.cfg.waves[0];
-    this.spawnUnit = w.unit;
-    this.spawnName = w.name;
-    this.spawnCooldown = w.spawnCooldown;
-    this.waveSound = w.sound;
-    yield 8;
-    this.emit('clearMessages', undefined);
-    this.run(this.trigWaveSpawn());
+    this.run('waveSpawn');
   }
 
   private spawnPoint() {
@@ -511,59 +643,82 @@ export class Game {
     return { x: (r.minX + r.maxX) / 2, y: (r.minY + r.maxY) / 2 };
   }
 
-  private *trigWaveSpawn(): Thread {
-    this.emit('doodadAnim', { id: 'D004', anim: 'birth' });
+  private *trigWaveSpawn(s: ThreadState): Thread {
     const sp = this.spawnPoint();
-    this.playSound('gg_snd_Gateway_Opens', sp.x, sp.y);
-    yield 1;
-    this.message(`|CFF6DCFF6Wave ${this.wave}:|r ${this.spawnName}`);
-    this.multiboardTitle = `Wave ${this.wave}`;
-    if (this.waveSound) this.emit('sound', { file: this.waveSound });
-    yield 1;
-    for (let i = 0; i < this.cfg.unitsPerWave; i++) {
-      if (this.ended) return;
-      this.createUnit(this.spawnUnit, CREEP_PLAYER, sp.x, sp.y, 0);
-      if (i < this.cfg.unitsPerWave - 1) yield this.spawnCooldown;
+    if (s.pc < 1) {
+      this.portal('birth');
+      this.playSound('gg_snd_Gateway_Opens', sp.x, sp.y);
+      s.pc = 1;
+      yield 1;
     }
-    yield 1;
-    this.emit('doodadAnim', { id: 'D004', anim: 'death' });
+    if (s.pc < 2) {
+      this.message(`|CFF6DCFF6Wave ${this.wave}:|r ${this.spawnName}`);
+      this.multiboardTitle = `Wave ${this.wave}`;
+      if (this.waveSound) this.emit('sound', { file: this.waveSound });
+      s.pc = 2;
+      s.i = 0;
+      yield 1;
+    }
+    if (s.pc < 3) {
+      while ((s.i ?? 0) < this.cfg.unitsPerWave) {
+        if (this.ended) return;
+        this.createUnit(this.spawnUnit, CREEP_PLAYER, sp.x, sp.y, 0);
+        s.i = (s.i ?? 0) + 1;
+        if (s.i < this.cfg.unitsPerWave) yield this.spawnCooldown;
+      }
+      s.pc = 3;
+      yield 1;
+    }
+    this.portal('death');
     this.playSound('gg_snd_Gateway_Closes', sp.x, sp.y);
   }
 
   private onCreepDeath() {
     // Trig_Wave_Clear: no living units of the current spawn type left.
     if (this.units.some((u) => u.alive && u.owner === CREEP_PLAYER && u.def.id === this.spawnUnit)) return;
-    this.run(this.trigWaveClear());
+    this.run('waveClear');
   }
 
-  private *trigWaveClear(): Thread {
-    if (this.wave > this.cfg.lastWave - 1) {
-      this.run(this.trigVictory());
-      return;
-    }
-    const bonus = this.wave * 10 + Math.floor((this.wave * this.wave) / this.playerCount);
-    for (const p of this.players) if (p.playing) {
-      p.gold += bonus;
-      p.earned += bonus;
-    }
-    this.message(`All players receive |cffffcc00${bonus} |rextra gold for surviving the wave.`);
-    this.playSound('gg_snd_GoodJob');
-    this.multiboardTitle = `Wave ${this.wave} completed!`;
+  private *trigWaveClear(s: ThreadState): Thread {
     const g1 = this.destructables.gg_dest_ZTg1_0091;
     const g2 = this.destructables.gg_dest_ZTg1_0092;
-    for (const g of [g1, g2]) if (g) this.modifyGate(g, true);
-    yield 3;
-    this.wave++;
-    this.nextWaveTimer = { end: this.time + this.cfg.nextWaveDelay };
-    this.timerUpdate = true;
-    yield this.cfg.nextWaveDelay - 0.1;
-    this.trigNextWaveSet();
-    yield 0.05;
-    if (g1) {
-      this.modifyGate(g1, false);
-      this.playSound('gg_snd_LockUp_Doors', g1.x, g1.y);
+    if (s.pc < 1) {
+      if (this.wave > this.cfg.lastWave - 1) {
+        this.run('victory');
+        return;
+      }
+      const bonus = this.wave * 10 + Math.floor((this.wave * this.wave) / this.playerCount);
+      for (const p of this.players) if (p.playing) {
+        p.gold += bonus;
+        p.earned += bonus;
+      }
+      this.message(`All players receive |cffffcc00${bonus} |rextra gold for surviving the wave.`);
+      this.playSound('gg_snd_GoodJob');
+      this.multiboardTitle = `Wave ${this.wave} completed!`;
+      for (const g of [g1, g2]) if (g) this.modifyGate(g, true);
+      s.pc = 1;
+      yield 3;
     }
-    yield 0.05;
+    if (s.pc < 2) {
+      this.wave++;
+      this.nextWaveTimer = { end: this.time + this.cfg.nextWaveDelay };
+      this.timerUpdate = true;
+      s.pc = 2;
+      yield this.cfg.nextWaveDelay - 0.1;
+    }
+    if (s.pc < 3) {
+      this.trigNextWaveSet();
+      s.pc = 3;
+      yield 0.05;
+    }
+    if (s.pc < 4) {
+      if (g1) {
+        this.modifyGate(g1, false);
+        this.playSound('gg_snd_LockUp_Doors', g1.x, g1.y);
+      }
+      s.pc = 4;
+      yield 0.05;
+    }
     if (g2) {
       this.modifyGate(g2, false);
       this.playSound('gg_snd_LockUp_Doors', g2.x, g2.y);
@@ -571,7 +726,7 @@ export class Game {
     this.timerUpdate = false;
     this.nextWaveTimer = null;
     this.trigClearPath();
-    this.run(this.trigWaveSpawn());
+    this.run('waveSpawn');
   }
 
   private modifyGate(d: Destructable, open: boolean) {
@@ -609,38 +764,49 @@ export class Game {
     }
   }
 
-  private *trigVictory(): Thread {
-    this.message('TRIGSTR_561');
-    const portal = this.destructables.gg_dest_OTsp_0074;
-    if (portal) portal.alive = false;
-    this.emit('fade', { dir: 'out', duration: 5 });
-    this.multiboardTitle = this.str('TRIGSTR_562');
-    yield 2.5;
-    this.multiboardTitle = this.str('TRIGSTR_563');
-    yield 1.8;
+  private *trigVictory(s: ThreadState): Thread {
+    if (s.pc < 1) {
+      this.message('TRIGSTR_561');
+      const portal = this.destructables.gg_dest_OTsp_0074;
+      if (portal) portal.alive = false;
+      this.emit('fade', { dir: 'out', duration: 5 });
+      this.multiboardTitle = this.str('TRIGSTR_562');
+      s.pc = 1;
+      yield 2.5;
+    }
+    if (s.pc < 2) {
+      this.multiboardTitle = this.str('TRIGSTR_563');
+      s.pc = 2;
+      yield 1.8;
+    }
     this.ended = { victory: true };
+    this.sampleScores();
     this.emit('end', { victory: true, text: 'Victory!' });
   }
 
-  private *lifeLost(u: Unit): Thread {
-    if (this.ended) return;
-    if (this.lives > 0) {
-      this.lives--;
-      this.message(`|CFF6DCFF6An unit has entered the gate! ${this.lives} lives remaining!|r`);
-      this.playSound('gg_snd_Warning');
-      const sp = this.spawnPoint();
-      this.teleport(u, sp.x, sp.y);
-    } else {
+  private *lifeLost(s: ThreadState, u?: Unit): Thread {
+    if (s.pc < 1) {
+      if (this.ended) return;
+      if (this.lives > 0) {
+        this.lives--;
+        this.message(`|CFF6DCFF6An unit has entered the gate! ${this.lives} lives remaining!|r`);
+        this.playSound('gg_snd_Warning');
+        const sp = this.spawnPoint();
+        if (u) this.teleport(u, sp.x, sp.y);
+        return;
+      }
       this.lifeLostEnabled = false;
       const portal = this.destructables.gg_dest_OTsp_0074;
       if (portal) portal.alive = false;
       this.emit('fade', { dir: 'out', duration: 5 });
       this.message('TRIGSTR_221');
       this.multiboardTitle = this.str('TRIGSTR_336');
+      s.pc = 1;
       yield 4;
-      this.ended = { victory: false };
-      this.emit('end', { victory: false, text: this.str('TRIGSTR_218') });
     }
+    this.ended = { victory: false };
+    this.sampleScores();
+    this.emit('end', { victory: false, text: this.str('TRIGSTR_218') });
   }
   private lifeLostEnabled = true;
 
@@ -700,7 +866,7 @@ export class Game {
           this.orderMove(u, g.x, g.y);
         }
       } else if (rect === 'Goal') {
-        if (this.lifeLostEnabled) this.run(this.lifeLost(u));
+        if (this.lifeLostEnabled) this.run('lifeLost', u);
       } else if (idx >= 0 && idx < path.length - 2) {
         const next = this.rectCenter(path[idx + 1]);
         this.orderMove(u, next.x, next.y);
@@ -822,6 +988,7 @@ export class Game {
       u.buildQueue = [];
     }
     u.constructs = null;
+    u.repairs = null;
     if (u.anim === 'work') u.anim = 'stand';
   }
 
@@ -839,7 +1006,10 @@ export class Game {
   }
 
   /** Construction orders of a builder, run every tick. */
-  private updateBuilder(u: Unit) {
+  private updateBuilder(u: Unit, dt = 0) {
+    if (u.repairs) return this.updateRepair(u, dt);
+    if (!u.constructs && !u.buildQueue.length) this.autoRepair(u);
+    if (u.repairs) return;
     const site = u.constructs;
     if (site) {
       if (!site.alive || !site.constructing || !this.units.includes(site)) {
@@ -878,6 +1048,7 @@ export class Game {
     t.anim = 'birth';
     u.constructs = t;
     this.players[u.owner].built++;
+    this.players[u.owner].producedValue += def.pointValue;
   }
 
   // --- spells ----------------------------------------------------------------------------------
@@ -929,20 +1100,73 @@ export class Game {
       const cost = Number(f['amcs@1'] ?? 0);
       if (u.mana < cost) continue;
       if (ab.base === 'Ablo' && u.owner === CREEP_PLAYER) {
-        // Computer-controlled casters autocast Bloodlust on allies in combat (attacking the gate or under fire).
-        const range = Number(f['aran@1'] ?? 600);
+        if (u.casting) continue;
         const buff = String(f['abuf@1'] ?? 'Bblo');
-        const target = this.units.find((c) => c.alive && c.owner === u.owner && !c.hidden && !c.buffs[buff] && (c.attackGate || this.time - c.lastDamaged < 3) && Math.hypot(c.x - u.x, c.y - u.y) <= range);
+        const target = this.bloodlustTarget(u, f, buff);
         if (!target) continue;
+        // Like an ordered cast: stop, face the target, play "spell"; the buff lands at the cast point.
         u.abilityCd[id] = this.time + Number(f['acdn@1'] ?? 1);
-        u.mana -= cost;
-        this.applyBuff(target, buff, this.spellDuration(target, f, 60), { attack: Number(f['Blo1@1'] ?? 0), move: Number(f['Blo2@1'] ?? 0), scale: Number(f['Blo3@1'] ?? 0) });
+        this.startCast(u, target, () => {
+          if (!target.alive || target.buffs[buff] || u.mana < cost) return;
+          u.mana -= cost;
+          this.applyBuff(target, buff, this.spellDuration(target, f, 60), { attack: Number(f['Blo1@1'] ?? 0), move: Number(f['Blo2@1'] ?? 0), scale: Number(f['Blo3@1'] ?? 0) });
+        });
       } else if (ab.base === 'Arpm' && u.autocast[id] !== false && u.owner !== CREEP_PLAYER) {
         this.castShareMana(u, id, true);
       }
     }
     for (const s of this.storms) if (s.next <= this.time && s.until > this.time) this.stormStrike(s);
     this.storms = this.storms.filter((s) => s.until > this.time);
+  }
+
+  /**
+   * Bloodlust autocast target of a computer caster: an own organic ground / air unit within cast range (aran) that
+   * fights – attacks the gate or took damage in the last 3 s – and has no Bloodlust yet. Units already attacking
+   * come first, then the nearest one.
+   */
+  private bloodlustTarget(u: Unit, f: Record<string, string | number>, buff: string) {
+    const range = Number(f['aran@1'] ?? 600);
+    const organicOnly = String(f['atar@1'] ?? 'organic').includes('organic');
+    let best: Unit | null = null;
+    let bestScore = Infinity;
+    for (const c of this.units) {
+      if (!c.alive || c.owner !== u.owner || c.hidden || c.def.isBuilding || c.buffs[buff]) continue;
+      if (organicOnly && String(c.def.fields.utyp ?? '').includes('mechanical')) continue;
+      const fighting = c.attackGate || this.time - c.lastDamaged < 3;
+      if (!fighting) continue;
+      const d = Math.hypot(c.x - u.x, c.y - u.y);
+      if (d > range) continue;
+      const score = d + (c.attackGate ? 0 : 10000);
+      if (score < bestScore) {
+        best = c;
+        bestScore = score;
+      }
+    }
+    return best;
+  }
+
+  /** Starts a cast animation: effect at the unit's cast point (ucpt), busy until the backswing (ucbs) ends. */
+  private startCast(u: Unit, target: Unit, apply: () => void) {
+    const point = Number(u.def.fields.ucpt ?? 0.3) || 0;
+    const back = Number(u.def.fields.ucbs ?? 0.51) || 0;
+    if (target !== u) u.facing = Math.atan2(target.y - u.y, target.x - u.x);
+    u.anim = 'spell';
+    u.animTime = 0;
+    u.casting = { fireAt: this.time + point, until: this.time + point + back, apply };
+    if (point <= 0) this.updateCasting(u);
+  }
+
+  private updateCasting(u: Unit) {
+    const c = u.casting!;
+    if (c.apply && this.time >= c.fireAt) {
+      const fire = c.apply;
+      c.apply = null;
+      fire();
+    }
+    if (this.time >= c.until) {
+      u.casting = null;
+      if (u.anim === 'spell') u.anim = 'stand';
+    }
   }
 
   /** Arpm (Share Mana): restores Rpb6 mana to nearby allies that miss it (autocast or by hand). */
@@ -1001,7 +1225,7 @@ export class Game {
     if (u.drain) this.stopDrain(u);
     u.drain = { target, until: this.time + duration, rate: Number(f['Ndr2@1'] ?? 10), range: Number(f['aare@1'] ?? 1000), ability: id };
     const lightning = this.cat?.abilityFx?.[ab.base]?.lightning;
-    this.emit('link', { id: u.uid, from: u, to: target, lightning: lightning?.[2] ?? lightning?.[0] ?? 'DRAM', until: u.drain.until });
+    this.emit('link', { id: u.uid, from: u, to: target, lightning: lightning?.[2] ?? lightning?.[0] ?? 'DRAM', until: u.drain.until, sound: this.cat?.abilityFx?.[ab.base]?.loopSound });
     this.applyBuff(u, 'Bdcm', duration, {});
     this.applyBuff(target, 'Bdtm', duration, {});
     return null;
@@ -1040,7 +1264,7 @@ export class Game {
     const buff = String(f['abuf@1'] ?? '');
     this.storms.push({ x, y, owner: u.owner, source: u, until: this.time + duration, next: this.time, interval: Math.max(0.1, Number(f['Esf2@1'] ?? 2)), damage: Number(f['Esf1@1'] ?? 50), radius: Number(f['aare@1'] ?? 250), buff });
     const fx = this.cat?.buffs?.[effect];
-    if (fx?.effectArt[0]) this.emit('spellArt', { model: fx.effectArt[0], x, y, sound: fx.loopSound });
+    if (fx?.effectArt[0]) this.emit('spellArt', { model: fx.effectArt[0], x, y, sound: fx.loopSound, duration });
     return null;
   }
 
@@ -1059,15 +1283,229 @@ export class Game {
     u.autocast[id] = on;
   }
 
+  /** Repair (Ahrp) data of a builder: cost / time ratios and Power Build cost / rate (Rep1–Rep4). */
+  private repairData(u: Unit) {
+    const id = u.def.abilities.find((a) => this.db.ability(a).base === 'Ahrp');
+    const f = id ? this.db.ability(id).fields : {};
+    return { id, costRatio: Number(f['Rep1@1'] ?? 0.35), timeRatio: Number(f['Rep2@1'] ?? 1.5), powerCost: Number(f['Rep3@1'] ?? 0.15), powerRate: Number(f['Rep4@1'] ?? 0.6) };
+  }
+
+  /** Gold is charged in whole coins: fractions are collected per player and taken once they add up to 1. */
+  private goldDebt: number[] = [];
+  private chargeFraction(owner: number, amount: number) {
+    const p = this.players[owner];
+    if (!p) return;
+    this.goldDebt[owner] = (this.goldDebt[owner] ?? 0) + amount;
+    const whole = Math.floor(this.goldDebt[owner]);
+    if (whole > 0) {
+      p.gold -= whole;
+      this.goldDebt[owner] -= whole;
+    }
+  }
+
+  /** Mechanical unit or structure (Ahrp targets: mechanical, structure). */
+  private repairable(t: Unit) {
+    return t.def.isBuilding || /\bmechanical\b/i.test(String(t.def.fields.utyp ?? ''));
+  }
+
+  /**
+   * Repair (Ahrp) like the engine: on an unfinished building it resumes the construction; on a damaged own mechanical
+   * unit or building the builder restores its hit points over buildTime × Rep2 for full health, paying
+   * Rep1 × its price in proportion.
+   */
+  orderRepair(builder: Unit, t: Unit): string | null {
+    if (builder.kind !== 'builder' || !this.repairData(builder).id) return null;
+    if (t.owner !== builder.owner || !t.alive || !this.repairable(t)) return ERR.targetRepair;
+    if (t.constructing) {
+      this.resumeConstruction(builder, t);
+      return null;
+    }
+    if (t.hp >= t.maxHp) return ERR.notDamaged;
+    this.clearOrders(builder);
+    builder.repairs = t;
+    this.approach(builder, t.x, t.y);
+    return null;
+  }
+
+  /** Autocast Repair: an idle builder repairs the nearest damaged own building / machine within 800 units. */
+  private autoRepair(u: Unit) {
+    const rp = this.repairData(u);
+    if (!rp.id || u.autocast[rp.id] === false || u.path || u.buildQueue.length || u.constructs || u.repairs) return;
+    let best = 800;
+    let target: Unit | null = null;
+    for (const t of this.units) {
+      if (t.owner !== u.owner || !t.alive || t.constructing || t.hp >= t.maxHp || !this.repairable(t) || t.def.abilities.includes('Avul')) continue;
+      const d = Math.hypot(t.x - u.x, t.y - u.y);
+      if (d < best) {
+        best = d;
+        target = t;
+      }
+    }
+    if (target) {
+      u.repairs = target;
+      this.approach(u, target.x, target.y);
+    }
+  }
+
+  private updateRepair(u: Unit, dt: number) {
+    const t = u.repairs!;
+    const rp = this.repairData(u);
+    if (!t.alive || t.hp >= t.maxHp || !this.units.includes(t)) {
+      u.repairs = null;
+      if (u.anim === 'work') u.anim = 'stand';
+      return;
+    }
+    if (Math.hypot(t.x - u.x, t.y - u.y) > BUILD_REACH) {
+      if (!u.path) this.approach(u, t.x, t.y);
+      return;
+    }
+    u.path = null;
+    u.moveTarget = null;
+    u.facing = Math.atan2(t.y - u.y, t.x - u.x);
+    const heal = Math.min(t.maxHp - t.hp, (t.maxHp * dt) / Math.max(0.1, t.def.buildTime * rp.timeRatio));
+    const cost = (heal / t.maxHp) * t.def.gold * rp.costRatio;
+    const p = this.players[u.owner];
+    if (cost > 0 && p && p.gold - (this.goldDebt[u.owner] ?? 0) < cost) {
+      this.emit('error', { owner: u.owner, text: ERR.noGold });
+      u.repairs = null;
+      u.anim = 'stand';
+      return;
+    }
+    this.chargeFraction(u.owner, cost);
+    t.hp += heal;
+    u.anim = 'work';
+  }
+
   /** Deterministic random numbers (tests, replays) – mulberry32 instead of Math.random. */
   seed(n: number) {
-    let a = n >>> 0;
-    this.rnd = () => {
-      a = (a + 0x6d2b79f5) | 0;
-      let t = Math.imul(a ^ (a >>> 15), 1 | a);
-      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-    };
+    this.rndState = n >>> 0;
+  }
+
+  // --- saved games ---------------------------------------------------------------------------
+
+  /**
+   * Snapshot of the whole simulation as plain JSON: units (references between units as uids, unit types as ids),
+   * missiles, storms, players, destructables, pathing occupancy, the random generator and the trigger threads
+   * with their progress. Spell casts in their wind-up are dropped (the caster simply casts again).
+   */
+  save(): SaveData {
+    const ref = (u: Unit | null | undefined) => (u ? u.uid : null);
+    const units = this.units.map((u) => ({
+      ...u,
+      def: u.def.id,
+      target: ref(u.target),
+      forcedTarget: ref(u.forcedTarget),
+      chase: ref(u.chase),
+      constructs: ref(u.constructs),
+      repairs: ref(u.repairs),
+      drain: u.drain ? { ...u.drain, target: u.drain.target.uid } : null,
+      poison: u.poison ? { ...u.poison, source: ref(u.poison.source) } : null,
+      casting: null,
+      rects: [...u.rects],
+    }));
+    const occupied: number[] = [];
+    const occ = this.grid.occupied;
+    for (let i = 0; i < occ.length; i++) {
+      if (!occ[i]) continue;
+      let j = i;
+      while (j < occ.length && occ[j] === occ[i]) j++;
+      occupied.push(i, j - i, occ[i]);
+      i = j - 1;
+    }
+    // ±Infinity (e.g. lastDamaged, endless stuns) would become null in JSON.
+    const replacer = (_k: string, v: unknown) => (v === Infinity ? '+Inf' : v === -Infinity ? '-Inf' : v);
+    return JSON.parse(
+      JSON.stringify({
+        version: 1,
+        scalars: {
+          time: this.time, playerCount: this.playerCount, lives: this.lives, wave: this.wave, spawnUnit: this.spawnUnit, spawnName: this.spawnName,
+          spawnCooldown: this.spawnCooldown, waveSound: this.waveSound, difficultyFactor: this.difficultyFactor, handicap: this.handicap,
+          multiboardTitle: this.multiboardTitle, multiboardVisible: this.multiboardVisible, nextWaveTimer: this.nextWaveTimer, timerUpdate: this.timerUpdate,
+          ended: this.ended, uidSeq: this.uidSeq, missileSeq: this.missileSeq, nextAuraRefresh: this.nextAuraRefresh, difficultyChosen: this.difficultyChosen,
+          lifeLostEnabled: this.lifeLostEnabled, nextSample: this.nextSample, threadSeq: this.threadSeq, rndState: this.rndState, portalOpen: this.portalOpen,
+        },
+        players: this.players,
+        goldDebt: this.goldDebt,
+        shopStock: this.shopStock,
+        destructables: this.destructables,
+        named: Object.fromEntries(Object.entries(this.named).map(([k, u]) => [k, u.uid])),
+        units,
+        missiles: this.missiles.map((m) => ({ ...m, source: m.source.uid, target: ref(m.target), bounce: m.bounce ? { ...m.bounce, hit: [...m.bounce.hit] } : null })),
+        storms: this.storms.map((s) => ({ ...s, source: s.source.uid })),
+        pendingShots: this.pendingShots.map((p) => ({ u: p.u.uid, t: p.t.uid, at: p.at })),
+        threads: this.threads.map((t) => ({ state: t.state, at: t.at, seq: t.seq })),
+        occupied,
+      }, replacer),
+    );
+  }
+
+  /**
+   * Restores a snapshot from save() into a started game: the current units are replaced (unitRemoved / unitAdded
+   * keep the renderer in sync) and the trigger threads continue where they were.
+   */
+  load(saved: SaveData) {
+    if (saved.version !== 1) throw new Error('Nepodporovaná verze uložené hry.');
+    const data: SaveData = JSON.parse(JSON.stringify(saved), (_k, v) => (v === '+Inf' ? Infinity : v === '-Inf' ? -Infinity : v));
+    for (const u of this.units) this.emit('unitRemoved', u);
+    Object.assign(this, data.scalars);
+    this.players = data.players;
+    this.goldDebt = data.goldDebt;
+    this.shopStock = data.shopStock;
+    for (const [k, d] of Object.entries(data.destructables)) this.destructables[k] = d;
+    const byUid = new Map<number, Unit>();
+    const units: Unit[] = data.units.map((s) => {
+      const u = { ...s, def: this.db.unit(s.def), rects: new Set(s.rects) } as unknown as Unit;
+      byUid.set(u.uid, u);
+      return u;
+    });
+    const get = (uid: number | null | undefined) => (uid === null || uid === undefined ? null : byUid.get(uid) ?? null);
+    data.units.forEach((s, i) => {
+      const u = units[i];
+      u.target = get(s.target);
+      u.forcedTarget = get(s.forcedTarget);
+      u.chase = get(s.chase);
+      u.constructs = get(s.constructs);
+      u.repairs = get(s.repairs);
+      u.drain = s.drain && get(s.drain.target) ? { ...s.drain, target: get(s.drain.target)! } : null;
+      u.poison = s.poison ? { ...s.poison, source: get(s.poison.source) } : null;
+      u.casting = null;
+      if (u.anim === 'spell') u.anim = 'stand';
+    });
+    this.units = units;
+    for (const k of Object.keys(this.named)) delete this.named[k];
+    for (const [k, uid] of Object.entries(data.named)) {
+      const u = get(uid);
+      if (u) this.named[k] = u;
+    }
+    this.missiles = data.missiles
+      .filter((m) => get(m.source))
+      .map((m) => ({ ...m, source: get(m.source)!, target: get(m.target), bounce: m.bounce ? { ...m.bounce, hit: new Set(m.bounce.hit) } : null }));
+    this.storms = data.storms.filter((s) => get(s.source)).map((s) => ({ ...s, source: get(s.source)! }));
+    const auras = this.auraSources();
+    this.pendingShots = data.pendingShots.filter((p) => get(p.u) && get(p.t)).map((p) => ({ u: get(p.u)!, t: get(p.t)!, at: p.at, auras }));
+    this.threads = data.threads.map((t) => ({ gen: this.threadGen(t.state), state: t.state, at: t.at, seq: t.seq }));
+    this.grid.occupied.fill(0);
+    for (let i = 0; i < data.occupied.length; i += 3) this.grid.occupied.fill(data.occupied[i + 2], data.occupied[i], data.occupied[i] + data.occupied[i + 1]);
+    for (const u of this.units) this.emit('unitAdded', u);
+    for (const m of this.missiles) this.emit('missileAdded', m);
+    this.emit('doodadAnim', { id: 'D004', anim: this.portalOpen ? 'birth' : 'death' });
+    // The start-up fade / difficulty dialog of the fresh game are replaced by the saved state.
+    this.emit('dialog', null);
+    if (!this.ended && (this.difficultyChosen || this.threads.some((t) => t.state.kind === 'slowSelector'))) this.emit('fade', { dir: 'in', duration: 0 });
+    this.restoreDialog();
+  }
+
+  /** Remaining time of the difficulty dialog (for restoring it after loading). */
+  get dialogRemaining() {
+    if (this.difficultyChosen) return 0;
+    const t = this.threads.find((x) => x.state.kind === 'slowSelector');
+    return t ? Math.max(0, t.at - this.time) : 0;
+  }
+
+  /** Shows the difficulty dialog again after loading a game saved while it was open. */
+  restoreDialog() {
+    if (this.difficultyChosen) return;
+    this.emit('dialog', { title: this.str('TRIGSTR_544'), buttons: this.cfg.difficulties.map((d, i) => ({ label: d.label, id: i })), timeout: this.dialogRemaining });
   }
 
   /** Click on a queued item in the info panel: removes it and refunds its cost (the first one restarts nothing). */
@@ -1118,13 +1556,27 @@ export class Game {
   }
 
   /** Buying from the Hightower shop (Life Bought / Gate Repaired triggers). */
+  /**
+   * Neutral shops (Ane2 "Select Unit") serve only a player whose unit stands within the ability's activation
+   * radius (Neu1, 450 in 1.26) – like the game, where the shop's buttons are disabled otherwise.
+   */
+  shopperNear(playerId: number, shop: Unit) {
+    const ab = shop.def.abilities.map((a) => this.db.ability(a)).find((a) => a.base === 'Ane2');
+    if (!ab) return true;
+    const r = Number(ab.fields['Neu1@1'] ?? 450);
+    return this.units.some((u) => u.alive && !u.hidden && u.owner === playerId && u.speed > 0 && Math.hypot(u.x - shop.x, u.y - shop.y) <= r);
+  }
+
   buy(playerId: number, id: string): string | null {
     const def = this.db.unit(id);
     const stock = this.shopStock[id];
     const p = this.players[playerId];
+    const shop = this.units.find((u) => u.alive && u.kind === 'shop' && u.def.sells.includes(id));
+    if (shop && !this.shopperNear(playerId, shop)) return ERR.noShopper;
     if (!stock || stock.stock <= 0) return ERR.outOfStock;
     if (p.gold < def.gold) return ERR.noGold;
     p.gold -= def.gold;
+    p.bought++;
     stock.stock--;
     if (stock.nextAt <= this.time) stock.nextAt = this.time + stock.regen;
     if (id === this.cfg.lifeBuyUnit) {
@@ -1181,7 +1633,18 @@ export class Game {
     u.holdPosition = false;
     u.chase = null;
     u.forcedTarget = null;
+    u.attackMove = null;
     this.moveTo(u, x, y);
+  }
+
+  /**
+   * Attack-move (A + click on the ground): like the engine the unit walks to the point, but stops for every enemy
+   * it acquires on the way, fights it (chasing within the acquisition range) and then continues. Units without
+   * a weapon simply move.
+   */
+  orderAttackMove(u: Unit, x: number, y: number) {
+    this.orderMove(u, x, y);
+    if (u.def.attack && u.speed > 0) u.attackMove = { x, y };
   }
 
   /** Hold Position (H): stop and do not chase enemies. */
@@ -1206,6 +1669,7 @@ export class Game {
   stop(u: Unit) {
     this.clearOrders(u);
     u.chase = null;
+    u.attackMove = null;
     u.holdPosition = false;
     u.moveTarget = null;
     u.path = null;
@@ -1227,8 +1691,35 @@ export class Game {
     }
   }
 
+  /**
+   * Score screen values. The game's exact formulas are not documented; like it, the unit score sums point values
+   * (upoi) of produced and killed units, the resource score is a tenth of the gathered gold; no heroes on this map.
+   */
+  score(p: PlayerState) {
+    const units = p.producedValue + p.killValue;
+    const resources = Math.floor(p.earned / 10);
+    return { units, heroes: 0, resources, total: units + resources };
+  }
+
+  private nextSample = 0;
+
+  /** Largest army and the score graph samples. */
+  sampleScores() {
+    for (const p of this.players) {
+      if (!p.playing) continue;
+      const army = this.units.filter((u) => u.alive && u.owner === p.id && !u.def.isBuilding && u.speed > 0).length;
+      p.largestArmy = Math.max(p.largestArmy, army);
+      const s = this.score(p);
+      p.history.push({ t: this.time, units: s.units, resources: s.resources, total: s.total });
+    }
+  }
+
   private step(dt: number) {
     this.time += dt;
+    if (this.time >= this.nextSample) {
+      this.sampleScores();
+      this.nextSample = this.time + 10;
+    }
     this.resumeThreads();
     for (const s of Object.values(this.shopStock)) {
       if (s.stock < s.max && s.nextAt && s.nextAt <= this.time) {
@@ -1239,14 +1730,26 @@ export class Game {
 
     const detectors = this.detectors();
     const auras = this.auraSources();
+    this.refreshAuraBuffs(auras);
 
     for (const u of this.units) {
       if (!u.alive) continue;
       u.animTime += dt;
       if (u.constructing) {
-        // Progress only while a builder works on it (Human construction).
-        if (!this.units.some((b) => b.constructs === u && b.alive && b.anim === 'work')) continue;
-        u.constructing.elapsed += dt;
+        // Progress only while a builder works on it (Human construction). Further builders help (Power Build,
+        // Ahrp Rep4 = rate per extra builder), each of them costs Rep3 × the building's price over the whole build.
+        const workers = this.units.filter((b) => b.constructs === u && b.alive && b.anim === 'work');
+        if (!workers.length) continue;
+        let rate = 1;
+        const rp = this.repairData(workers[0]);
+        for (let i = 1; i < workers.length; i++) {
+          const fee = (rp.powerCost * u.def.gold * dt) / u.constructing.total;
+          const p = this.players[u.owner];
+          if (!p || p.gold < fee) break;
+          this.chargeFraction(u.owner, fee);
+          rate += rp.powerRate;
+        }
+        u.constructing.elapsed += dt * rate;
         u.hp = Math.min(u.maxHp, u.maxHp * (0.1 + 0.9 * (u.constructing.elapsed / u.constructing.total)));
         if (u.constructing.elapsed >= u.constructing.total) {
           u.constructing = null;
@@ -1278,12 +1781,19 @@ export class Game {
       if (u.poison && u.poison.until > this.time) this.damage(u, u.poison.dps * dt, 'spells', u.poison.source, true);
       else u.poison = null;
       if (!u.alive) continue;
-      if (u.stunUntil > this.time) continue;
+      if (u.stunUntil > this.time) {
+        u.casting = null;
+        continue;
+      }
       if (u.slow && u.slow.until <= this.time) u.slow = null;
+      if (u.casting) {
+        this.updateCasting(u);
+        continue;
+      }
 
       if (u.kind === 'creep') this.updateCreep(u, dt);
       else if (u.speed > 0 && u.path) this.moveAlong(u, dt);
-      if (u.kind === 'builder') this.updateBuilder(u);
+      if (u.kind === 'builder') this.updateBuilder(u, dt);
       this.updateSpells(u, dt);
 
       if (u.def.attack && u.kind !== 'creep' && !u.hidden) this.updateAttacker(u, dt, detectors, auras);
@@ -1297,6 +1807,7 @@ export class Game {
       u.rects = now;
     }
 
+    this.separateUnits(dt);
     this.firePendingShots();
     this.updateMissiles(dt);
 
@@ -1318,6 +1829,11 @@ export class Game {
       const angle = this.rnd() * Math.PI * 2;
       const nu = this.createUnit(q.id, u.owner, u.x + Math.cos(angle) * 220, u.y + Math.sin(angle) * 220, angle);
       nu.anim = 'birth';
+      const p = this.players[u.owner];
+      if (p) {
+        p.trained++;
+        p.producedValue += nu.def.pointValue;
+      }
       this.emit('trained', nu);
     } else {
       const p = this.players[u.owner];
@@ -1386,6 +1902,61 @@ export class Game {
     return d - step;
   }
 
+  /**
+   * Unit collisions (ucol) for the player's ground units (builders, defenders): overlapping units are pushed
+   * apart; a moving or working unit pushes an idle one aside, like the engine. A mover whose destination is
+   * occupied by an idle unit stops next to it instead of pushing forever. Creeps walk the lane without collisions
+   * (their move type is "none", see 6.3), flyers do not collide.
+   */
+  private separateUnits(dt: number) {
+    const list = this.units.filter((u) => u.alive && !u.hidden && !u.flying && u.speed > 0 && u.owner < CREEP_PLAYER && u.kind !== 'creep');
+    if (list.length < 2) return;
+    const radius = (u: Unit) => Math.max(8, num(u.def.fields.ucol) || 16);
+    const busy = (u: Unit) => !!u.path || u.anim === 'work' || u.anim === 'attack';
+    for (let i = 0; i < list.length; i++)
+      for (let j = i + 1; j < list.length; j++) {
+        const a = list[i];
+        const b = list[j];
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let d = Math.hypot(dx, dy);
+        const min = radius(a) + radius(b);
+        if (d >= min) continue;
+        if (d < 0.01) {
+          // Exactly on top of each other: separate along a deterministic direction.
+          dx = Math.cos(a.uid);
+          dy = Math.sin(a.uid);
+          d = 1;
+        }
+        const nx = dx / d;
+        const ny = dy / d;
+        const ba = busy(a);
+        const bb = busy(b);
+        for (const [m, idle] of [[a, b], [b, a]] as const) {
+          const dest = m.path?.[m.path.length - 1];
+          if (busy(m) && !busy(idle) && dest && Math.hypot(dest[0] - idle.x, dest[1] - idle.y) < min && Math.hypot(dest[0] - m.x, dest[1] - m.y) < min * 1.5) {
+            m.path = null;
+            m.moveTarget = null;
+            if (m.anim === 'walk') m.anim = 'stand';
+          }
+        }
+        // Share of the overlap each unit takes (the idle one yields when the other is busy).
+        const shareA = ba === bb ? 0.5 : ba ? 0 : 1;
+        const push = Math.min(min - d, 300 * dt);
+        this.nudge(a, -nx * push * shareA, -ny * push * shareA);
+        this.nudge(b, nx * push * (1 - shareA), ny * push * (1 - shareA));
+      }
+  }
+
+  /** Moves a unit by (dx, dy) when the target cell is walkable. */
+  private nudge(u: Unit, dx: number, dy: number) {
+    if (!dx && !dy) return;
+    const [cx, cy] = this.grid.cellOf(u.x + dx, u.y + dy);
+    if (!this.grid.walkable(cx, cy)) return;
+    u.x += dx;
+    u.y += dy;
+  }
+
   private moveAlong(u: Unit, dt: number) {
     if (!u.path || !u.path.length) {
       u.path = null;
@@ -1424,16 +1995,34 @@ export class Game {
   }
 
   private auraSources() {
-    const out: { u: Unit; base: string; range: number; value: number }[] = [];
+    const out: { u: Unit; base: string; range: number; value: number; buff: string }[] = [];
     for (const u of this.units) {
       if (!u.alive || u.constructing || u.owner >= 3) continue;
       for (const id of u.def.abilities) {
         const ab = this.db.ability(id);
-        if (ab.base === 'AOae') out.push({ u, base: 'AOae', range: Number(ab.fields['aare@1'] ?? 900), value: Number(ab.fields['Oae2@1'] ?? 0) });
-        else if (ab.base === 'ACac') out.push({ u, base: 'ACac', range: Number(ab.fields['aare@1'] ?? 900), value: Number(ab.fields['Cac1@1'] ?? 0) });
+        const buff = String(ab.fields['abuf@1'] ?? '').split(',')[0];
+        if (ab.base === 'AOae') out.push({ u, base: 'AOae', range: Number(ab.fields['aare@1'] ?? 900), value: Number(ab.fields['Oae2@1'] ?? 0), buff: buff || 'BOae' });
+        else if (ab.base === 'ACac') out.push({ u, base: 'ACac', range: Number(ab.fields['aare@1'] ?? 900), value: Number(ab.fields['Cac1@1'] ?? 0), buff: buff || 'BOac' });
       }
     }
     return out;
+  }
+
+  /**
+   * Units inside an aura carry its buff (only for the target art, e.g. GeneralAuraTarget – the bonus itself is
+   * computed by auraBonus). Like the engine the buffs are refreshed periodically and linger briefly after leaving.
+   */
+  private refreshAuraBuffs(auras: ReturnType<Game['auraSources']>) {
+    if (this.time < this.nextAuraRefresh) return;
+    this.nextAuraRefresh = this.time + 0.25;
+    if (!auras.length) return;
+    for (const u of this.units) {
+      if (!u.alive || u.hidden || u.owner >= CREEP_PLAYER || u.constructing) continue;
+      for (const a of auras) {
+        if (Math.hypot(a.u.x - u.x, a.u.y - u.y) > a.range + 72) continue;
+        this.applyBuff(u, a.buff, 0.6, {});
+      }
+    }
   }
 
   private auraBonus(u: Unit, auras: ReturnType<Game['auraSources']>, base: string) {
@@ -1468,8 +2057,13 @@ export class Game {
     // Mobile units (temple defenders) walk to targets like the engine: an ordered target is followed, otherwise
     // enemies within the acquisition range (uacq) are engaged – unless the unit holds its position or is moving.
     if (u.speed > 0 && u.kind === 'defender') {
+      // A plain move order ignores enemies until the unit arrives (only an explicit target is attacked).
+      if (u.moveTarget && !u.chase && !u.attackMove && !u.forcedTarget) {
+        u.target = null;
+        return;
+      }
       if (t) {
-        if (u.chase) {
+        if (u.chase || u.attackMove) {
           u.chase = null;
           u.path = null;
           u.moveTarget = null;
@@ -1478,7 +2072,7 @@ export class Game {
         const valid = (c: Unit | null) => !!c && c.alive && this.canTarget(u, c, detectors);
         let c: Unit | null = valid(u.forcedTarget) ? u.forcedTarget : null;
         if (!c && valid(u.chase) && Math.hypot(u.chase!.x - u.x, u.chase!.y - u.y) <= a.acquire * 1.25) c = u.chase;
-        if (!c && !u.holdPosition && (!u.moveTarget || u.chase)) {
+        if (!c && !u.holdPosition && (!u.moveTarget || u.chase || u.attackMove)) {
           let best = a.acquire;
           for (const e of this.units) {
             if (e.owner !== CREEP_PLAYER || !this.canTarget(u, e, detectors)) continue;
@@ -1502,6 +2096,11 @@ export class Game {
           u.chase = null;
           u.path = null;
           u.moveTarget = null;
+        }
+        // Nothing to fight: an attack-move continues to its destination, which ends the order.
+        if (u.attackMove && !u.path) {
+          if (Math.hypot(u.attackMove.x - u.x, u.attackMove.y - u.y) < 32) u.attackMove = null;
+          else this.moveTo(u, u.attackMove.x, u.attackMove.y);
         }
       }
     }
@@ -1750,6 +2349,7 @@ export class Game {
     if (owner >= 0 && owner < 3) {
       const p = this.players[owner];
       p.kills++;
+      p.killValue += t.def.pointValue;
       if (killer) killer.kills++;
       // Bounty: native unit bounty in single player, Trig_Multiplayer_Bounty otherwise.
       let gold: number;

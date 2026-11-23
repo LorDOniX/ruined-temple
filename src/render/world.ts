@@ -4,10 +4,10 @@ import type { ObjectDB } from '../data/objects';
 import { CREEP_PLAYER, PLAYER_COLORS, attackColor, type Destructable, type Game, type Missile, type Unit } from '../game/game';
 import { TerrainGrid } from './terrain';
 import { clone as cloneSkinned } from 'three/examples/jsm/utils/SkeletonUtils.js';
-import { MaterialAnimator, Wc3Assets, startGlobalClips, applyReplaceable, applyTeamColor, instantiate, pickSequence, type ModelAnimations, type SequenceInfo } from './mdx';
-import { ParticleSystem, type ModelEvent } from './particles';
+import { MaterialAnimator, Wc3Assets, sequenceVariants, startGlobalClips, applyReplaceable, applyTeamColor, instantiate, pickSequence, type ModelAnimations, type SequenceInfo } from './mdx';
+import { ParticleSystem, type ModelEvent, type ModelParticle } from './particles';
 import { DecalLayer, type Decal } from './decals';
-import type { SoundPlayer } from '../sound';
+import type { LoopHandle, SoundPlayer } from '../sound';
 import {
   auraTowerPlaceholder,
   builderPlaceholder,
@@ -47,6 +47,12 @@ interface UnitAnim {
   seq: SequenceInfo | null;
   action: THREE.AnimationAction | null;
   lastAnimTime: number;
+  /** The current idle animation has random variants (re-picked whenever one ends). */
+  variants?: boolean;
+  /** Animation time not yet applied while the unit is off screen (animation LOD). */
+  pending?: number;
+  /** Meshes of the model; off screen they leave the camera layer so three.js skips their skeleton update too. */
+  meshes?: THREE.Mesh[];
 }
 
 interface MissileView {
@@ -106,6 +112,8 @@ export class WorldView {
   localPlayer = 0;
   /** Currently selected units (selection circles). */
   selection = new Set<Unit>();
+  /** Blob shadows under units (video option). */
+  showShadows = true;
   /** Health bars above all units – like the game, only while Alt is held. */
   showAllHp = false;
   private hpMatBg = new THREE.SpriteMaterial({ color: 0x000000, depthTest: false });
@@ -126,6 +134,10 @@ export class WorldView {
     overlayRoot: HTMLElement,
   ) {
     this.world.rotation.x = -Math.PI / 2;
+    // Static: without auto update three.js no longer forces a matrix update of every object below each frame,
+    // so units off screen can skip theirs (animation LOD).
+    this.world.updateMatrix();
+    this.world.matrixAutoUpdate = false;
     scene.add(this.world);
     this.world.add(this.regionsGroup);
     this.regionsGroup.visible = false;
@@ -140,6 +152,7 @@ export class WorldView {
     this.floatLayer = overlayRoot;
     this.particles = new ParticleSystem(this.world);
     this.particles.onEvent = (e) => this.modelEvent(e);
+    this.particles.modelParticle = (path) => this.modelParticle(path);
     this.decals = assets?.catalog.ui ? new DecalLayer(this.world, (x, y) => this.grid.heightAt(x, y), (p) => assets.loadTexture(p)) : null;
 
     game.on('unitAdded', (u) => this.addUnit(u));
@@ -152,13 +165,20 @@ export class WorldView {
     });
     game.on('buff', (e) => this.buffArt(e.unit, e.id, e.on));
     game.on('spellArt', (e) => {
-      if (e.sound) this.sound?.playLabel(e.sound, { x: e.x, y: e.y });
+      const storm = e.unit ? 0 : (e.duration ?? 20);
+      // Looping effect sounds (Effectsoundlooped, e.g. MonsoonLoop) run for the spell's duration.
+      if (e.sound && storm > 0 && this.sound?.isLooping(e.sound)) this.addLoop(this.sound.playLoop(e.sound, { x: e.x, y: e.y }), { until: this.gclock + storm });
+      else if (e.sound) this.sound?.playLabel(e.sound, { x: e.x, y: e.y });
       const path = e.model.replace(/\.md[lx]$/i, '');
       if (!path) return;
-      const storm = e.unit ? 0 : 20;
       this.spawnModel(path, e.x, e.y, this.grid.heightAt(e.x, e.y) + (e.unit?.fly ?? 0), 0, 'birth', storm);
     });
-    game.on('link', (e) => this.link(e.id, e.from, e.to, e.lightning, e.until));
+    game.on('link', (e) => {
+      this.link(e.id, e.from, e.to, e.lightning, e.until);
+      // A link replaces / ends the previous one of the caster, with its channel loop (SiphonManaLoop).
+      this.stopLoops((l) => l.linkId === e.id);
+      if (e.lightning && e.sound) this.addLoop(this.sound?.playLoop(e.sound, { x: e.from.x, y: e.from.y }) ?? null, { linkId: e.id, until: this.gclock + Math.max(0.1, e.until - this.game.time) });
+    });
     game.on('lightning', (e) => this.lightning(e.from, e.to, e.color, e.model));
     game.on('floatText', (e) => this.floatText(e.text, e.x, e.y, e.color, e.lifespan));
     game.on('combatHit', (e) => this.sound?.playLabel(`${e.weaponSound}${e.armor}`, { x: e.x, y: e.y }));
@@ -379,6 +399,8 @@ export class WorldView {
   private addUnit(u: Unit) {
     const { obj, height } = this.placeholderFor(u);
     const root = new THREE.Group();
+    // Particle emitters of units use the bone matrices of the last rendered frame (see ParticleSystem.update).
+    root.userData.lagOk = true;
     const body = new THREE.Group();
     body.add(obj);
     root.add(body);
@@ -394,24 +416,33 @@ export class WorldView {
     root.add(hpBg, hpFg);
     const baseScale = 1;
     this.world.add(root);
-    const view: UnitView = { root, body, hpBg, hpFg, selection: sel, circle, shadow, height, defId: u.def.id, baseScale, anim: null };
+    const view: UnitView = { root, body, hpBg, hpFg, selection: sel, circle, shadow, height, defId: this.visualDef(u).id, baseScale, anim: null };
     this.units.set(u.uid, view);
     void this.upgradeUnit(u, view);
   }
 
+  /**
+   * The definition whose model is shown: while a building upgrades, the engine already shows the new building's
+   * model playing its "Birth Upgrade …" sequence along with the upgrade progress (scaffolding growing).
+   */
+  private visualDef(u: Unit) {
+    return u.upgrading && u.alive ? this.db.unit(u.upgrading.to) : u.def;
+  }
+
   private async upgradeUnit(u: Unit, view: UnitView) {
-    if (!this.assets || !u.def.model || !this.assets.modelExists(u.def.model)) return;
-    const model = await this.assets.loadModel(u.def.model, String(u.def.fields.uani ?? ''));
-    if (!model || !this.units.has(u.uid) || view.defId !== u.def.id) return;
+    const def = this.visualDef(u);
+    if (!this.assets || !def.model || !this.assets.modelExists(def.model)) return;
+    const model = await this.assets.loadModel(def.model, String(def.fields.uani ?? ''));
+    if (!model || !this.units.has(u.uid) || view.defId !== def.id || this.visualDef(u).id !== def.id) return;
     view.body.clear();
     view.body.position.z = 0;
     // SkeletonUtils.clone rebinds the skinned meshes to the cloned bones.
     const m = cloneSkinned(model);
-    m.scale.setScalar(u.def.scale);
-    applyTeamColor(this.assets, m, u.owner);
+    m.scale.setScalar(def.scale);
+    applyTeamColor(this.assets, m, this.colorOf(u.owner));
     view.body.add(m);
     const h = Number(model.userData.height) || 0;
-    view.height = Math.min(600, Math.max(60, (h || 120) * u.def.scale));
+    view.height = Math.min(600, Math.max(60, (h || 120) * def.scale));
     const info = this.assets.animations(model);
     const anim: UnitAnim = { model: m, mixer: info ? new THREE.AnimationMixer(m) : null, info, current: '', seq: null, action: null, lastAnimTime: 0 };
     view.anim = anim;
@@ -427,7 +458,7 @@ export class WorldView {
   /** Plays the unit's current animation with the matching MDX sequence (animation tags from the "uani" field). */
   private playAnimation(u: Unit, a: UnitAnim, name: string) {
     if (!a.mixer || !a.info) return;
-    const tags = String(u.def.fields.uani ?? '')
+    const tags = String(this.visualDef(u).fields.uani ?? '')
       .toLowerCase()
       .split(',')
       .map((s) => s.trim())
@@ -439,13 +470,15 @@ export class WorldView {
     startGlobalClips(a.mixer, a.info);
     const action = a.mixer.clipAction(seq.clip);
     action.reset();
-    const once = name === 'attack' || name === 'death' || name === 'birth' || seq.nonLooping;
-    action.setLoop(once ? THREE.LoopOnce : THREE.LoopRepeat, Infinity);
-    action.clampWhenFinished = once;
+    const once = name === 'attack' || name === 'death' || name === 'birth' || name === 'spell' || seq.nonLooping;
+    // Idle animations with several variants play one at a time and pick the next variant when it ends.
+    a.variants = !once && (name === 'stand' || name === 'work') && sequenceVariants(a.info.sequences, name, tags).length > 1;
+    action.setLoop(once || a.variants ? THREE.LoopOnce : THREE.LoopRepeat, Infinity);
+    action.clampWhenFinished = once || a.variants;
     action.timeScale = 1;
     if (name === 'walk' && seq.moveSpeed > 0) action.timeScale = Math.max(0.2, (u.speed * (u.slow ? 1 - u.slow.move : 1)) / seq.moveSpeed);
     // Construction: the birth sequence follows the construction progress (it stops while no builder works).
-    if (name === 'birth' && u.constructing) action.timeScale = 0;
+    if (name === 'birth' && (u.constructing || u.upgrading)) action.timeScale = 0;
     action.play();
     a.seq = seq;
     a.action = action;
@@ -456,7 +489,7 @@ export class WorldView {
 
   private updateAnimation(u: Unit, a: UnitAnim, dt: number) {
     if (!a.mixer) return;
-    const wanted = !u.alive ? 'death' : u.constructing ? 'birth' : u.anim === 'birth' ? 'stand' : u.anim;
+    const wanted = !u.alive ? 'death' : u.constructing || u.upgrading ? 'birth' : u.anim === 'birth' ? 'stand' : u.anim;
     const restarted = wanted === 'attack' && u.animTime < a.lastAnimTime;
     a.lastAnimTime = u.animTime;
     if (wanted !== a.current || restarted) this.playAnimation(u, a, wanted);
@@ -464,10 +497,13 @@ export class WorldView {
       // Between attacks the unit idles, the next attack restarts the attack sequence.
       this.playAnimation(u, a, 'stand');
       a.current = 'attack';
+    } else if (a.variants && a.action && !a.action.isRunning()) {
+      this.playAnimation(u, a, wanted);
     } else if (wanted === 'walk' && a.action && a.seq && a.seq.moveSpeed > 0) {
       a.action.timeScale = Math.max(0.2, (u.speed * (u.slow ? 1 - u.slow.move : 1)) / a.seq.moveSpeed);
     }
-    if (wanted === 'birth' && u.constructing && a.action && a.seq) a.action.time = a.seq.duration * Math.min(0.999, u.constructing.elapsed / Math.max(0.1, u.constructing.total));
+    const build = u.constructing ?? u.upgrading;
+    if (wanted === 'birth' && build && a.action && a.seq) a.action.time = a.seq.duration * Math.min(0.999, build.elapsed / Math.max(0.1, build.total));
     a.mixer.update(dt);
   }
 
@@ -500,9 +536,78 @@ export class WorldView {
     return { circle, shadow };
   }
 
+  /**
+   * Corpses (UI\MiscData.txt): after the death sequence the body stays and plays "Decay Flesh" until BoneDecayTime
+   * (88 s) after the death, then turns to bones ("Decay Bone") that sink into the ground over DecayTime (2 s).
+   * The game logic drops dead units after 1.5 s; the renderer keeps the body on its own. At most 120 corpses.
+   */
+  private corpses: { v: UnitView; u: Unit; died: number; stage: 'death' | 'flesh' | 'bone'; boneAt: number }[] = [];
+  private static readonly BONE_DECAY = 88;
+  private static readonly DECAY = 2;
+
+  private keepCorpse(u: Unit, v: UnitView) {
+    const a = v.anim;
+    if (!a?.mixer || !a.info || u.flying || !pickSequence(a.info.sequences, 'decay', ['flesh'])) return false;
+    v.hpBg.visible = v.hpFg.visible = false;
+    v.selection.visible = false;
+    if (v.circle) this.decals?.remove(v.circle);
+    if (v.shadow) this.decals?.remove(v.shadow);
+    v.circle = v.shadow = null;
+    // Game time (u.removeAt = moment of death), so pausing / game speed apply.
+    this.corpses.push({ v, u, died: u.removeAt, stage: 'death', boneAt: u.removeAt + WorldView.BONE_DECAY });
+    while (this.corpses.length > 120) {
+      const old = this.corpses.shift()!;
+      this.world.remove(old.v.root);
+    }
+    return true;
+  }
+
+  private playCorpse(a: UnitAnim, name: string, tag: string) {
+    const seq = a.info && pickSequence(a.info.sequences, name, [tag]);
+    if (!seq || !a.mixer) return;
+    a.mixer.stopAllAction();
+    const action = a.mixer.clipAction(seq.clip);
+    action.reset().setLoop(THREE.LoopOnce, 1);
+    action.clampWhenFinished = true;
+    action.play();
+    a.seq = seq;
+    a.action = action;
+    a.model.traverse((o) => {
+      if ((o as THREE.Mesh).isMesh && o.name in seq.visibility) o.visible = seq.visibility[o.name];
+    });
+  }
+
+  private updateCorpses(dt: number) {
+    this.corpses = this.corpses.filter((c) => {
+      const a = c.v.anim!;
+      if (c.stage === 'death' && (!a.action || !a.action.isRunning())) {
+        c.stage = 'flesh';
+        this.playCorpse(a, 'decay', 'flesh');
+      } else if (c.stage === 'flesh' && this.game.time >= c.boneAt) {
+        c.stage = 'bone';
+        this.playCorpse(a, 'decay', 'bone');
+      }
+      a.mixer!.update(dt);
+      if (c.stage === 'bone') {
+        const t = (this.game.time - c.boneAt) / WorldView.DECAY;
+        c.v.body.position.z = -Math.max(0, t) * 30;
+        if (t >= 1) {
+          this.world.remove(c.v.root);
+          return false;
+        }
+      }
+      return true;
+    });
+  }
+
   private removeUnit(u: Unit) {
     const v = this.units.get(u.uid);
     if (!v) return;
+    if (!u.alive && this.units.get(u.uid) === v && this.keepCorpse(u, v)) {
+      this.units.delete(u.uid);
+      this.buffArts.delete(u.uid);
+      return;
+    }
     this.world.remove(v.root);
     if (v.circle) this.decals?.remove(v.circle);
     if (v.shadow) this.decals?.remove(v.shadow);
@@ -604,6 +709,85 @@ export class WorldView {
     }
   }
 
+  /** Ally colour mode (Alt+A): you blue, allies teal, enemies red; otherwise the player colours. */
+  private allyColors = false;
+  /** Full opacity of each selection circle (pre-selected circles are drawn at half of it). */
+  private circleAlpha = new WeakMap<Decal, number>();
+
+  private colorOf(owner: number) {
+    if (!this.allyColors || owner > CREEP_PLAYER) return owner;
+    return owner === this.localPlayer ? 1 : owner === CREEP_PLAYER ? 0 : 2;
+  }
+
+  setAllyColors(on: boolean) {
+    if (on === this.allyColors || !this.assets) return;
+    this.allyColors = on;
+    // Team colour swaps materials; the highlight is re-applied on top of the new ones.
+    this.highlight(null);
+    for (const u of this.game.units) {
+      const v = this.units.get(u.uid);
+      if (v?.anim) applyTeamColor(this.assets, v.anim.model, this.colorOf(u.owner));
+    }
+  }
+
+  /** Running loop sounds: spell loops end at `until` (game clock), links with their bolt, construction per building. */
+  private loops: { handle: LoopHandle; until?: number; linkId?: number; uid?: number }[] = [];
+
+  private addLoop(handle: LoopHandle | null, opts: { until?: number; linkId?: number; uid?: number }) {
+    if (handle) this.loops.push({ handle, ...opts });
+  }
+
+  private stopLoops(pred: (l: WorldView['loops'][number]) => boolean) {
+    this.loops = this.loops.filter((l) => {
+      if (!pred(l)) return true;
+      l.handle.stop();
+      return false;
+    });
+  }
+
+  /**
+   * Construction loop (unit field ubsl, BuildingConstructionLoop) while a builder works on a site; loops of spells
+   * stop when their time is up.
+   */
+  private updateLoops() {
+    if (!this.sound) return;
+    const working = new Set<number>();
+    for (const u of this.game.units) if (u.alive && u.constructs?.constructing && u.anim === 'work') working.add(u.constructs.uid);
+    this.stopLoops((l) => (l.uid !== undefined && !working.has(l.uid)) || (l.until !== undefined && this.gclock >= l.until));
+    for (const uid of working) {
+      if (this.loops.some((l) => l.uid === uid)) continue;
+      const site = this.game.units.find((u) => u.uid === uid)!;
+      const label = String(site.def.fields.ubsl ?? '').trim() || 'BuildingConstructionLoop';
+      this.addLoop(this.sound.playLoop(label, { x: site.x, y: site.y }), { uid });
+    }
+  }
+
+  /** Templates of type 1 particle models (null = missing / failed, undefined entry = loading). */
+  private particleModels = new Map<string, THREE.Group | null | 'loading'>();
+
+  /** Instance of a type 1 particle model playing its first sequence; null until the template is loaded. */
+  private modelParticle(path: string): ModelParticle | null {
+    const t = this.particleModels.get(path);
+    if (t === undefined) {
+      this.particleModels.set(path, 'loading');
+      if (!this.assets?.modelExists(path)) this.particleModels.set(path, null);
+      else void this.assets.loadModel(path).then((m) => this.particleModels.set(path, m));
+      return null;
+    }
+    if (!t || t === 'loading') return null;
+    const obj = cloneSkinned(t);
+    const info = this.assets!.animations(t);
+    const seq = info?.sequences[0];
+    if (!info || !seq) return { obj, update: () => {} };
+    const mixer = new THREE.AnimationMixer(obj);
+    startGlobalClips(mixer, info);
+    mixer.clipAction(seq.clip).setLoop(THREE.LoopRepeat, Infinity).play();
+    obj.traverse((o) => {
+      if ((o as THREE.Mesh).isMesh && o.name in seq.visibility) o.visible = seq.visibility[o.name];
+    });
+    return { obj, update: (dt) => mixer.update(dt) };
+  }
+
   /** A model spawned by an SPN event (blood gush, debris) or an instant attack's impact: plays one sequence once. */
   /** @param loopFor > 0: the stand sequence loops for this many seconds (e.g. the Skyfury rain cloud). */
   private spawnModel(path: string, x: number, y: number, z: number, yaw: number, sequence = 'birth', loopFor = 0) {
@@ -658,7 +842,7 @@ export class WorldView {
     void this.assets.loadModel(path).then((model) => {
       if (!model || !obj.parent) return;
       const inst = cloneSkinned(model);
-      applyTeamColor(this.assets!, inst, mv.owner);
+      applyTeamColor(this.assets!, inst, this.colorOf(mv.owner));
       obj.add(inst);
       this.matAnim.register(inst, () => (mv.state.seq && mv.state.action ? { interval: mv.state.seq.interval, frame: mv.state.seq.interval[0] + mv.state.action.time * 1000 } : null), model.userData.globals ?? []);
       const info = this.assets!.animations(model);
@@ -985,14 +1169,36 @@ export class WorldView {
 
   // --- per frame ---------------------------------------------------------------------------------------
 
+  /**
+   * Animation LOD: units outside the view (plus a margin) advance their animation only every OFFSCREEN_STEP seconds
+   * and skip the matrix update of their bones and the emission of their particles in between – bone matrices,
+   * mixers and emitters of a whole wave are the main CPU cost. The accumulated time is applied at once, so the
+   * animation phase stays exact; event objects (blood, sounds) still fire.
+   */
+  private static readonly OFFSCREEN_STEP = 0.25;
+  private viewFrustum = new THREE.Frustum();
+  private viewSphere = new THREE.Sphere();
+  /** Units whose animation ran this frame / was deferred (for profiling). */
+  animStats = { full: 0, deferred: 0 };
+
+  private onScreen(u: Unit, v: UnitView, ground: number) {
+    const r = Math.max(v.height, 120) * v.baseScale + 250;
+    this.viewSphere.center.set(u.x, u.y, ground + u.fly + v.height * 0.5);
+    this.viewSphere.radius = r;
+    return this.viewFrustum.intersectsSphere(this.viewSphere);
+  }
+
   update(dt: number, camera: THREE.Camera, width: number, height: number) {
     this.clock += dt;
     const g = this.game;
+    camera.updateMatrixWorld();
+    this.viewFrustum.setFromProjectionMatrix(new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse));
+    this.animStats.full = this.animStats.deferred = 0;
     for (const u of g.units) {
       const v = this.units.get(u.uid);
       if (!v) continue;
-      if (v.defId !== u.def.id) {
-        // Upgrade / morph finished – rebuild visuals.
+      if (v.defId !== this.visualDef(u).id) {
+        // Upgrade started / cancelled / finished or morph – rebuild visuals.
         this.removeUnit(u);
         this.addUnit(u);
         continue;
@@ -1004,8 +1210,28 @@ export class WorldView {
       let s = 1;
       let opacity = 1;
       if (v.anim) {
-        this.updateAnimation(u, v.anim, g.paused ? 0 : dt * g.speed);
-        if (!u.alive) opacity = 1 - Math.min(1, Math.max(0, (g.time - u.removeAt - 0.6) / 0.9));
+        const a = v.anim;
+        const step = (g.paused ? 0 : dt * g.speed) + (a.pending ?? 0);
+        const busy = !u.alive || !!u.constructing || !!u.upgrading || this.selection.has(u);
+        const near = busy || this.onScreen(u, v, ground);
+        if (near || step >= WorldView.OFFSCREEN_STEP) {
+          a.pending = 0;
+          v.root.matrixWorldAutoUpdate = true;
+          this.updateAnimation(u, a, step);
+          this.animStats.full++;
+        } else {
+          // Leaving the view: start at a per-unit phase so the deferred updates of a wave spread over frames.
+          a.pending = v.root.matrixWorldAutoUpdate ? step + ((u.uid * 0.618) % 1) * WorldView.OFFSCREEN_STEP * 0.9 : step;
+          v.root.matrixWorldAutoUpdate = false;
+          this.animStats.deferred++;
+        }
+        if (!a.meshes) {
+          a.meshes = [];
+          a.model.traverse((o) => (o as THREE.Mesh).isMesh && a.meshes!.push(o as THREE.Mesh));
+        }
+        for (const m of a.meshes) m.layers.mask = near ? 1 : 0;
+        // Bodies with decay sequences stay as corpses (updateCorpses); others fade out.
+        if (!u.alive && !(v.anim.info && pickSequence(v.anim.info.sequences, 'decay', ['flesh']) && !u.flying)) opacity = 1 - Math.min(1, Math.max(0, (g.time - u.removeAt - 0.6) / 0.9));
       } else if (!u.alive) {
         const t = Math.min(1, (g.time - u.removeAt) / 1.2);
         s = 1 - t * 0.6;
@@ -1034,7 +1260,11 @@ export class WorldView {
       v.selection.visible = this.selection.has(u) && u.alive;
       v.selection.position.z = 4 - u.fly;
       if (v.circle) {
-        v.circle.visible = v.selection.visible && !u.hidden;
+        // Pre-selection: the unit under the cursor shows its circle at half opacity, like the game.
+        const pre = !v.selection.visible && this.hover?.unit === u && u.alive;
+        if (!this.circleAlpha.has(v.circle)) this.circleAlpha.set(v.circle, v.circle.color[3]);
+        v.circle.color[3] = this.circleAlpha.get(v.circle)! * (pre ? 0.5 : 1);
+        v.circle.visible = (v.selection.visible || pre) && !u.hidden;
         v.circle.x = u.x;
         v.circle.y = u.y;
       }
@@ -1043,7 +1273,7 @@ export class WorldView {
         const f = u.def.fields;
         v.shadow.x = u.x - (Number(f.ushx) || 0) + v.shadow.halfW;
         v.shadow.y = u.y - (Number(f.ushy) || 0) + v.shadow.halfH;
-        v.shadow.visible = !u.hidden && opacity > 0.05;
+        v.shadow.visible = this.showShadows && !u.hidden && opacity > 0.05;
         v.shadow.color[3] = (this.assets!.catalog.ui!.shadowColor[0] / 255) * opacity * (stealth ? 0.4 : 1);
       }
       const showHp = u.alive && !u.hidden && (this.showAllHp || !!u.constructing || !!u.upgrading);
@@ -1130,6 +1360,8 @@ export class WorldView {
       return !!p.root.parent;
     });
     this.matAnim.update(gdt, this.world);
+    this.updateCorpses(gdt);
+    this.updateLoops();
     this.particles.update(gdt, camera);
     this.decals?.update(gdt);
     this.updateHover(camera, width, height);
@@ -1152,9 +1384,14 @@ export class WorldView {
    * floating above the unit under the cursor.
    */
   setHover(u: Unit | null, ownerName: (u: Unit) => { name: string; color: string }) {
-    if (this.hover?.unit === u) return;
+    if (this.hover?.unit === u) {
+      // The model may have loaded (or been rebuilt by an upgrade) since the cursor came over the unit.
+      if (u && this.highlighted?.model !== this.units.get(u.uid)?.anim?.model) this.highlight(u);
+      return;
+    }
     this.hover?.el.remove();
     this.hover = null;
+    this.highlight(u);
     if (!u) return;
     const el = document.createElement('div');
     el.className = 'hover-label';
@@ -1171,6 +1408,41 @@ export class WorldView {
     this.hover = { el, unit: u, bar };
   }
 
+  /** Meshes of the highlighted model with their original materials (restored when the cursor leaves). */
+  private highlighted: { model: THREE.Object3D; meshes: [THREE.Mesh, THREE.Material][] } | null = null;
+
+  /**
+   * Mouse-over highlight like the game: the unit under the cursor is drawn brighter. Its meshes get brightened
+   * material copies (additive effect layers stay as they are); the originals come back when the cursor leaves.
+   */
+  private highlight(u: Unit | null) {
+    if (this.highlighted) {
+      for (const [mesh, mat] of this.highlighted.meshes) {
+        (mesh.material as THREE.Material).dispose();
+        mesh.material = mat;
+      }
+      this.highlighted = null;
+    }
+    const model = u ? this.units.get(u.uid)?.anim?.model : null;
+    if (!model) return;
+    const meshes: [THREE.Mesh, THREE.Material][] = [];
+    model.traverse((o) => {
+      const mesh = o as THREE.Mesh;
+      if (!mesh.isMesh || Array.isArray(mesh.material)) return;
+      const orig = mesh.material as THREE.MeshLambertMaterial;
+      if (orig.blending === THREE.AdditiveBlending || !orig.color) return;
+      const bright = orig.clone();
+      if ((bright as THREE.MeshLambertMaterial).isMeshLambertMaterial) {
+        // Lit materials: the texture also glows a little, so the unit stays brighter even in shadow / at night.
+        bright.emissive.setScalar(0.55);
+        bright.emissiveMap = bright.map;
+      } else bright.color.multiplyScalar(1.45);
+      mesh.material = bright;
+      meshes.push([mesh, orig]);
+    });
+    this.highlighted = { model, meshes };
+  }
+
   private updateHover(camera: THREE.Camera, width: number, height: number) {
     const h = this.hover;
     if (!h) return;
@@ -1180,6 +1452,7 @@ export class WorldView {
       this.setHover(null, () => ({ name: '', color: '' }));
       return;
     }
+    if (this.highlighted?.model !== v.anim?.model) this.highlight(u);
     const p = this.world.localToWorld(tmpV.set(u.x, u.y, this.grid.heightAt(u.x, u.y) + u.fly + v.height + 40)).project(camera);
     h.el.style.transform = `translate(${((p.x + 1) / 2) * width}px, ${((1 - p.y) / 2) * height}px) translate(-50%, -100%)`;
     const ratio = Math.max(0, u.hp / u.maxHp);

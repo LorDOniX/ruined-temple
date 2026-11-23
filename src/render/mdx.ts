@@ -113,9 +113,13 @@ export class Wc3Assets {
     return null;
   }
 
+  /** Texture quality option: 1 = model textures at half resolution (low), 0 = full (the HUD keeps full icons). */
+  textureLevel = 0;
+
   private async doLoadTexture(key: string) {
-    const img = await this.decodeImage(key);
+    let img = await this.decodeImage(key);
     if (!img) return null;
+    for (let i = 0; i < this.textureLevel && img.width > 64 && img.height > 64; i++) img = halve(img);
     const tex = new THREE.DataTexture(new Uint8Array(img.data.buffer), img.width, img.height, THREE.RGBAFormat);
     tex.colorSpace = THREE.SRGBColorSpace;
     tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
@@ -306,6 +310,13 @@ export class Wc3Assets {
       });
     }
     group.userData.emitters2 = emitters2;
+    // Particle emitters (type 1) – each particle is a whole model (bones, gore, lightning sparks …).
+    const emitters1: Emitter1Def[] = [];
+    for (const e of (model.particleEmitters as any[]) ?? []) {
+      if (!(e.objectId >= 0) || !boneIndex.has(e.objectId) || !/\.md[lx]$/i.test(String(e.path ?? ''))) continue;
+      emitters1.push({ node: `n${e.objectId}`, raw: e, model: String(e.path).replace(/\.md[lx]$/i, '') });
+    }
+    group.userData.emitters1 = emitters1;
     // Ribbon emitters (arrow / spear trails …) – simulated by ParticleSystem as well.
     const ribbons: RibbonDef[] = [];
     for (const r of (model.ribbonEmitters as any[]) ?? []) {
@@ -443,6 +454,14 @@ export interface Emitter2Def {
   priorityPlane: number;
 }
 
+/** Particle emitter (type 1) of a model template: spawns instances of `model` (see mdx-m3-viewer's Particle). */
+export interface Emitter1Def {
+  node: string;
+  /** Parser object – KPEE rate, KPEL life span, KPES speed, KPLT latitude, KPEG gravity, KPEV visibility. */
+  raw: any;
+  model: string;
+}
+
 /** Ribbon emitter of a model template (see mdx-m3-viewer's RibbonEmitterObject). */
 export interface RibbonDef {
   node: string;
@@ -549,17 +568,28 @@ const words = (s: { name: string }) => String(s.name).toLowerCase().split(/[\s-]
  * Picks a sequence like the game: sequence names are unordered tag sets ("Stand Upgrade First Ready Attack"),
  * so the animation name may be any word; prefer sequences carrying the unit's animation tags, then the plainest.
  */
-export function pickSequence<T extends { name: string }>(seqs: T[], anim: string, tags: string[] = []): T | undefined {
+export function pickSequence<T extends { name: string; rarity?: number }>(seqs: T[], anim: string, tags: string[] = []): T | undefined {
+  const top = sequenceVariants(seqs, anim, tags);
+  if (!top.length) return undefined;
+  // Variants ("Stand", "Stand - 2" …) are chosen at random; a higher rarity makes one less frequent.
+  const weight = (s: T) => 1 / (1 + Math.max(0, Number(s.rarity) || 0));
+  let r = Math.random() * top.reduce((n, s) => n + weight(s), 0);
+  for (const s of top) if ((r -= weight(s)) <= 0) return s;
+  return top[top.length - 1];
+}
+
+/** All equally fitting sequences for an animation name (its random variants). */
+export function sequenceVariants<T extends { name: string }>(seqs: T[], anim: string, tags: string[] = []): T[] {
   const cands = seqs.filter((s) => words(s).includes(anim) && !words(s).includes('portrait'));
-  if (!cands.length) return undefined;
+  if (!cands.length) return [];
   const score = (s: T) => {
-    const w = words(s);
+    // Variant numbers ("Stand - 2", "Attack -2") are not tags.
+    const w = words(s).filter((x) => !/^\d+$/.test(x));
     const hits = tags.filter((t) => w.includes(t)).length;
     return hits * 100 - (w.length - 1 - hits);
   };
   const best = Math.max(...cands.map(score));
-  const top = cands.filter((s) => score(s) === best);
-  return top[Math.floor(Math.random() * top.length)];
+  return cands.filter((s) => score(s) === best);
 }
 
 /** Keyframes of one track inside a sequence (or its global sequence), with exact values at both ends. */
@@ -573,22 +603,53 @@ function trackKeys(anim: any, [start, end]: [number, number], globals: number[])
   return { lo, hi: global ? lo : hi, idx, global };
 }
 
+const hermite = (a: number, b: number, c: number, d: number, t: number) => {
+  const t2 = t * t;
+  return a * (t2 * (2 * t - 3) + 1) + b * (t2 * (t - 2) + t) + c * (t2 * (t - 1)) + d * (t2 * (3 - 2 * t));
+};
+const bezier = (a: number, b: number, c: number, d: number, t: number) => {
+  const u = 1 - t;
+  return a * u * u * u + b * 3 * t * u * u + c * 3 * t * t * u + d * t * t * t;
+};
+const quat = (v: ArrayLike<number>) => new THREE.Quaternion(v[0], v[1], v[2], v[3]);
+
+/**
+ * Value between two keys like the game (mdx-m3-viewer's Sd): linear, hermite or bezier with the keys' out / in
+ * tangents; quaternion curves use spherical quadrangle interpolation (squad: slerp of the slerps by 2t(1−t)).
+ */
+function interpolate(anim: any, i: number, j: number, t: number, isQuat: boolean): number[] {
+  const a = anim.values[i] as Float32Array;
+  const b = anim.values[j] as Float32Array;
+  const type = anim.interpolationType;
+  if (isQuat) {
+    if (type >= 2 && anim.outTans?.[i] && anim.inTans?.[j]) {
+      const q1 = quat(a).slerp(quat(b), t);
+      const q2 = quat(anim.outTans[i]).slerp(quat(anim.inTans[j]), t);
+      const q = q1.slerp(q2, 2 * t * (1 - t));
+      return [q.x, q.y, q.z, q.w];
+    }
+    const q = quat(a).slerp(quat(b), t);
+    return [q.x, q.y, q.z, q.w];
+  }
+  if (type >= 2 && anim.outTans?.[i] && anim.inTans?.[j]) {
+    const f = type === 2 ? hermite : bezier;
+    return Array.from(a, (v, n) => f(v, anim.outTans[i][n], anim.inTans[j][n], b[n], t));
+  }
+  return Array.from(a, (v, n) => v + (b[n] - v) * t);
+}
+
 function sample(anim: any, idx: number[], frame: number, quat: boolean): number[] {
   const frames: number[] = anim.frames;
   let k = 0;
   while (k < idx.length - 1 && frames[idx[k + 1]] <= frame) k++;
   const i = idx[k];
-  const a = Array.from(anim.values[i] as Float32Array);
-  if (frames[i] >= frame || k === idx.length - 1 || anim.interpolationType === 0) return a;
+  if (frames[i] >= frame || k === idx.length - 1 || anim.interpolationType === 0) return Array.from(anim.values[i] as Float32Array);
   const j = idx[k + 1];
-  const tt = Math.min(1, (frame - frames[i]) / Math.max(1, frames[j] - frames[i]));
-  const b = Array.from(anim.values[j] as Float32Array);
-  if (quat) {
-    const q = new THREE.Quaternion(a[0], a[1], a[2], a[3]).slerp(new THREE.Quaternion(b[0], b[1], b[2], b[3]), tt);
-    return [q.x, q.y, q.z, q.w];
-  }
-  return a.map((v, n) => v + (b[n] - v) * tt);
+  return interpolate(anim, i, j, Math.min(1, (frame - frames[i]) / Math.max(1, frames[j] - frames[i])), quat);
 }
+
+/** Hermite / bezier curves are baked into extra keys (~30 per second) – three.js tracks interpolate linearly. */
+const CURVE_STEP_MS = 33;
 
 function keyTimes(anim: any, iv: [number, number], globals: number[], quat: boolean, size: number, fallback: number[]) {
   const { lo, hi, idx } = trackKeys(anim, iv, globals);
@@ -603,7 +664,15 @@ function keyTimes(anim: any, iv: [number, number], globals: number[], quat: bool
   } else {
     const frames: number[] = anim.frames;
     if (frames[idx[0]] > lo) push(lo, sample(anim, idx, lo, quat));
-    for (const i of idx) push(frames[i], Array.from(anim.values[i] as Float32Array));
+    const curve = anim.interpolationType >= 2;
+    idx.forEach((i, n) => {
+      push(frames[i], Array.from(anim.values[i] as Float32Array));
+      const j = idx[n + 1];
+      if (!curve || j === undefined) return;
+      const span = frames[j] - frames[i];
+      const steps = Math.min(16, Math.floor(span / CURVE_STEP_MS));
+      for (let k = 1; k < steps; k++) push(frames[i] + (span * k) / steps, interpolate(anim, i, j, k / steps, quat));
+    });
     if (frames[idx[idx.length - 1]] < hi) push(hi, sample(anim, idx, hi, quat));
   }
   return { times, values };
@@ -754,6 +823,21 @@ export function applyReplaceable(assets: Wc3Assets, root: THREE.Object3D, id: nu
       m.needsUpdate = true;
     }
   });
+}
+
+/** Image at half resolution (2×2 box filter). */
+function halve(img: ImageData): ImageData {
+  const w = img.width >> 1;
+  const h = img.height >> 1;
+  const out = new Uint8ClampedArray(w * h * 4);
+  const s = img.data;
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++)
+      for (let c = 0; c < 4; c++) {
+        const i = (y * 2 * img.width + x * 2) * 4 + c;
+        out[(y * w + x) * 4 + c] = (s[i] + s[i + 4] + s[i + img.width * 4] + s[i + img.width * 4 + 4]) >> 2;
+      }
+  return { width: w, height: h, data: out, colorSpace: 'srgb' } as ImageData;
 }
 
 let teamColor: THREE.DataTexture | null = null;

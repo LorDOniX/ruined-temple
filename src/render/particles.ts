@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { evalTrackAt, evalVecTrackAt, type Emitter2Def, type EventDef, type RibbonDef } from './mdx';
+import { evalTrackAt, evalVecTrackAt, type Emitter1Def, type Emitter2Def, type EventDef, type RibbonDef } from './mdx';
 
 /**
  * MDX particle emitters (type 2) – explosions, fire, sparks, missile trails. Behaviour follows the game /
@@ -12,6 +12,10 @@ import { evalTrackAt, evalVecTrackAt, type Emitter2Def, type EventDef, type Ribb
  * Ribbon emitters (arrow / spear trails) emit a chain of segments (node ± height above/below) that live for
  * `lifeSpan` seconds; the chain is drawn as a strip whose texture runs from the newest to the oldest segment.
  * Event objects (KEVT) fire `onEvent` when the animation passes one of their frames (sounds, splats, spawns).
+ *
+ * Particle emitters of type 1 spawn whole models (bones and gore of exploding units, lightning sparks): each
+ * particle is an instance of the emitter's model playing its first sequence, launched from the node in a random
+ * direction within `latitude` around the node's Z axis, falling with gravity until its life span ends.
  */
 
 /** Animation state of an emitting model instance: active sequence interval and current frame (ms). */
@@ -23,11 +27,31 @@ interface Source {
   emission: number[];
   lastKey: number[];
   ribbons: { chain: RibbonChain; bone: THREE.Object3D | null }[];
+  emitters1: Emitter1State[];
   events: { def: EventDef; bone: THREE.Object3D | null; last: number }[];
   frame: FrameSource;
   root: THREE.Object3D;
   alive: boolean;
   globals: number[];
+}
+
+interface Emitter1State {
+  def: Emitter1Def;
+  bone: THREE.Object3D | null;
+  emission: number;
+}
+
+/** A model instance provided by the renderer for a type 1 particle. */
+export interface ModelParticle {
+  obj: THREE.Object3D;
+  update(dt: number): void;
+}
+
+interface Particle1 {
+  inst: ModelParticle;
+  v: THREE.Vector3;
+  gravity: number;
+  health: number;
 }
 
 interface RibbonSegment {
@@ -94,14 +118,23 @@ const AXIS_X = new THREE.Vector3(1, 0, 0);
 const AXIS_Y = new THREE.Vector3(0, 1, 0);
 const AXIS_Z = new THREE.Vector3(0, 0, 1);
 const MAX_PARTICLES = 6000;
+const MAX_MODEL_PARTICLES = 300;
 
 export class ParticleSystem {
   private sources: Source[] = [];
   private particles: Particle[] = [];
   private chains: RibbonChain[] = [];
+  private models: Particle1[] = [];
+  /**
+   * Creates an instance of a model for a type 1 particle, or null while the model is still loading / missing
+   * (the renderer caches templates; the emission is simply skipped until the model is ready).
+   */
+  modelParticle: ((path: string) => ModelParticle | null) | null = null;
   private batches = new Map<string, Batch>();
   /** Emission factor 0.25–1, lowered by the renderer when the frame rate drops (like the particle quality option). */
   quality = 1;
+  /** Upper limit of `quality` from the particle option (high 1, medium 0.5, low 0.25). */
+  maxQuality = 1;
   /** Called for every event object the animation passes (SND / SPL / UBR / SPN). */
   onEvent: ((e: ModelEvent) => void) | null = null;
   private clockMs = 0;
@@ -114,7 +147,8 @@ export class ParticleSystem {
     const defs = (template.userData.emitters2 as Emitter2Def[] | undefined) ?? [];
     const ribbons = (template.userData.ribbons as RibbonDef[] | undefined) ?? [];
     const events = (template.userData.events as EventDef[] | undefined) ?? [];
-    if (!defs.length && !ribbons.length && !events.length) return null;
+    const defs1 = (template.userData.emitters1 as Emitter1Def[] | undefined) ?? [];
+    if (!defs.length && !ribbons.length && !events.length && !defs1.length) return null;
     const byName = new Map<string, THREE.Object3D>();
     root.traverse((o) => {
       if ((o as THREE.Bone).isBone) byName.set(o.name, o);
@@ -126,6 +160,7 @@ export class ParticleSystem {
       emission: defs.map(() => 0),
       lastKey: defs.map(() => -1),
       ribbons: [],
+      emitters1: defs1.map((def) => ({ def, bone: byName.get(def.node) ?? null, emission: 0 })),
       events: events.map((def) => ({ def, bone: byName.get(def.node) ?? null, last: 0 })),
       frame,
       root,
@@ -136,22 +171,37 @@ export class ParticleSystem {
       this.chains.push(chain);
       src.ribbons.push({ chain, bone: byName.get(def.node) ?? null });
     }
+    root.updateWorldMatrix(true, true);
     this.sources.push(src);
     return { stop: () => (src.alive = false) };
   }
 
   update(dt: number, camera: THREE.Camera) {
     this.clockMs += dt * 1000;
-    this.world.updateMatrixWorld();
+    // Units (root.userData.lagOk) emit from the bone matrices of the last rendered frame – the renderer updates the
+    // world once per frame; other sources (missiles, effects) move fast and are brought up to date here.
+    for (const s of this.sources) if (!lagOk(s.root, this.world)) s.root.updateWorldMatrix(true, true);
     this.invWorld.copy(this.world.matrixWorld).invert();
     this.sources = this.sources.filter((s) => s.alive && this.attached(s.root));
     for (const c of this.chains) if (c.source && !this.sources.includes(c.source)) c.source = null;
     if (dt > 0) {
       for (const s of this.sources) {
-        if (!visibleIn(s.root, this.world)) continue;
+        if (!visibleIn(s.root, this.world) || deferred(s.root, this.world)) continue;
         this.emit(s, dt);
         this.emitRibbons(s, dt);
+        this.emitModels(s, dt);
       }
+      this.models = this.models.filter((p) => {
+        p.health -= dt;
+        if (p.health <= 0) {
+          p.inst.obj.removeFromParent();
+          return false;
+        }
+        p.v.z -= p.gravity * dt;
+        p.inst.obj.position.addScaledVector(p.v, dt);
+        p.inst.update(dt);
+        return true;
+      });
       for (const p of this.particles) {
         p.health -= dt;
         p.v.z -= p.gravity * dt;
@@ -212,6 +262,42 @@ export class ParticleSystem {
         this.onEvent({ type: e.def.type, id: e.def.id, x: tmpP.x, y: tmpP.y, z: tmpP.z, yaw: Math.atan2(fwd.y, fwd.x), root: s.root });
       }
       e.last = value;
+    }
+  }
+
+  private emitModels(s: Source, dt: number) {
+    if (!s.emitters1.length || !this.modelParticle) return;
+    const f = s.frame();
+    if (!f) return;
+    for (const e of s.emitters1) {
+      if (!e.bone) continue;
+      const d = e.def.raw;
+      const at = (n: string, fb: number) => evalTrackAt(d, n, fb, f.interval, f.frame, s.globals, this.clockMs).value;
+      if (at('KPEV', 1) <= 0) {
+        e.emission = 0;
+        continue;
+      }
+      e.emission += at('KPEE', d.emissionRate) * dt * this.quality;
+      if (e.emission < 1) continue;
+      const life = at('KPEL', d.lifeSpan);
+      const speed = at('KPES', d.speed);
+      const latitude = at('KPLT', d.latitude);
+      const gravity = at('KPEG', d.gravity);
+      tmpM.multiplyMatrices(this.invWorld, e.bone.matrixWorld);
+      tmpM.decompose(tmpP, tmpQ, tmpS);
+      while (e.emission >= 1) {
+        e.emission -= 1;
+        if (this.models.length >= MAX_MODEL_PARTICLES) continue;
+        const inst = this.modelParticle(e.def.model);
+        if (!inst) continue;
+        tmpQ2.setFromAxisAngle(AXIS_Z, rnd(Math.PI)).multiply(new THREE.Quaternion().setFromAxisAngle(AXIS_Y, rnd(latitude)));
+        const v = AXIS_Z.clone().applyQuaternion(tmpQ2).applyQuaternion(tmpQ).multiplyScalar(speed).multiply(tmpS);
+        inst.obj.position.copy(tmpP);
+        inst.obj.rotation.set(0, 0, Math.random() * Math.PI * 2);
+        inst.obj.scale.copy(tmpS);
+        this.world.add(inst.obj);
+        this.models.push({ inst, v, gravity: gravity * tmpS.z, health: life });
+      }
     }
   }
 
@@ -517,4 +603,15 @@ export class ParticleSystem {
 function visibleIn(o: THREE.Object3D, world: THREE.Object3D) {
   for (let cur: THREE.Object3D | null = o; cur && cur !== world; cur = cur.parent) if (!cur.visible) return false;
   return true;
+}
+
+/** Off-screen unit whose matrices are frozen by the animation LOD – it does not emit until it is updated again. */
+function deferred(o: THREE.Object3D, world: THREE.Object3D) {
+  for (let cur: THREE.Object3D | null = o; cur && cur !== world; cur = cur.parent) if (!cur.matrixWorldAutoUpdate) return true;
+  return false;
+}
+
+function lagOk(o: THREE.Object3D, world: THREE.Object3D) {
+  for (let cur: THREE.Object3D | null = o; cur && cur !== world; cur = cur.parent) if (cur.userData.lagOk) return true;
+  return false;
 }

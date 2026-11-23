@@ -160,7 +160,7 @@ export interface MapData {
 /** public/war3/catalog.json produced by tools/assets.ts from the original game data (optional). */
 export interface AssetCatalog {
   terrain: Record<string, { file: string; name: string }>;
-  cliffs: Record<string, { texture: string; modelDir: string; groundTile: string; name: string }>;
+  cliffs: Record<string, { texture: string; modelDir: string; rampDir?: string; groundTile: string; name: string }>;
   water: { texture: string; numTex: number; texRate: number; height: number; deep: number[][]; shallow: number[][] } | null;
   /** Doodad/destructable id → model path (without extension) and variation count. */
   doodads: Record<string, { file: string; numVar: number; pathTex?: string; name?: string; category?: string; fixedRotation?: number; texId?: number; texFile?: string; armor?: string }>;
@@ -188,6 +188,11 @@ export interface AssetCatalog {
   lightnings?: Record<string, { texture: string; avgSegLen: number; width: number; color: number[]; noiseScale: number; texCoordScale: number; duration: number }>;
   /** "SPNx<id>" spawned models (Splats\SpawnData.slk) – model path without extension. */
   spawns?: Record<string, string>;
+  /**
+   * Ambient sounds of SetAmbientDaySound / SetAmbientNightSound (UI\SoundInfo\MIDISounds.slk): a MIDI sequence
+   * played with the instruments of a DLS sound bank; dawn / dusk sounds (rooster, wolf) are sound labels.
+   */
+  ambient?: { day?: AmbientDef; night?: AmbientDef; dawn?: string; dusk?: string };
   /** UI\war3skins.txt cursor model of the local player's race, UI\MiscData.txt selection circles / shadows. */
   ui?: {
     cursor: string;
@@ -200,6 +205,13 @@ export interface AssetCatalog {
   };
 }
 
+export interface AmbientDef {
+  midi: string;
+  dls: string;
+  /** 0–127 */
+  volume: number;
+}
+
 export interface SoundDef {
   files: string[];
   /** 0–127 */
@@ -209,7 +221,10 @@ export interface SoundDef {
   minDistance: number;
   maxDistance: number;
   distanceCutoff: number;
+  /** SLK channel: 1 selection, 2 acknowledgement, 3 movement, 4 ready, … 13 spell loops. */
   channel: number;
+  /** Higher plays first when all voices are taken. */
+  priority?: number;
   flags: string;
 }
 

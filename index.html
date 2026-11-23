@@ -58,14 +58,15 @@
 
         <div id="messages"></div>
         <div id="sys-messages"></div>
+        <div id="chat" hidden><span id="chat-to">Všem:</span><input id="chat-input" maxlength="127" autocomplete="off" spellcheck="false" /></div>
         <div id="idle-worker" title="Nečinný dělník (Tab)"><span class="count">1</span></div>
 
         <div id="minimap-buttons">
           <div class="mm-btn" id="mm-ping" title="Signál (Alt+G)"></div>
-          <div class="mm-btn" id="mm-terrain" title="Zobrazit terén"></div>
+          <div class="mm-btn" id="mm-terrain" title="Zobrazit terén (Alt+T)"></div>
           <div class="mm-btn" id="mm-ally" title="Barvy spojenců (Alt+A)"></div>
-          <div class="mm-btn" id="mm-creep" title="Zobrazit příšery"></div>
-          <div class="mm-btn round" id="mm-formation" title="Formace"></div>
+          <div class="mm-btn" id="mm-creep" title="Zobrazit příšery (Alt+C)"></div>
+          <div class="mm-btn round" id="mm-formation" title="Pohyb ve formaci (Alt+F)"></div>
         </div>
         <div id="portrait"></div>
         <div id="portrait-hp"></div>
@@ -80,8 +81,8 @@
         <div class="menu-view" id="menu-main">
           <h2>Nabídka</h2>
           <button id="btn-pause">Pozastavit hru (Pause)</button>
-          <button disabled title="Ukládání hry zatím není k dispozici.">Uložit hru</button>
-          <button disabled title="Ukládání hry zatím není k dispozici.">Nahrát hru</button>
+          <button id="btn-save">Uložit hru</button>
+          <button id="btn-load">Nahrát hru</button>
           <button id="btn-options">Možnosti</button>
           <button id="btn-endgame">Ukončit hru</button>
           <button id="btn-help">Nápověda (F1)</button>
@@ -93,13 +94,34 @@
           <button id="btn-speed">Rychlost hry: 1×</button>
           <label>Posun myší <input type="range" id="opt-mouse-scroll" min="0.25" max="2" step="0.05" /></label>
           <label>Posun klávesnicí <input type="range" id="opt-key-scroll" min="0.25" max="2" step="0.05" /></label>
+          <button id="btn-keys">Klávesové zkratky: výchozí</button>
+          <button id="btn-keys-file">Načíst CustomKeys.txt…</button>
+          <input type="file" id="opt-keys-file" accept=".txt" hidden />
+          <h3>Grafika</h3>
+          <button id="btn-gfx-particles">Částice: vysoké</button>
+          <button id="btn-gfx-textures">Textury: vysoké</button>
+          <button id="btn-gfx-resolution">Rozlišení vykreslování: 100 %</button>
+          <label><input type="checkbox" id="opt-shadows" /> Stíny jednotek</label>
           <h3>Zvuk</h3>
           <label><input type="checkbox" id="opt-sound" /> Zvukové efekty <input type="range" id="opt-sound-volume" min="0" max="1" step="0.05" /></label>
           <label><input type="checkbox" id="opt-music" /> Hudba <input type="range" id="opt-music-volume" min="0" max="1" step="0.05" /></label>
+          <label><input type="checkbox" id="opt-ambient" /> Okolní zvuky</label>
           <h3>Ladění</h3>
           <button id="btn-regions">Regiony a trasa příšer (F2)</button>
           <button id="btn-pathing">Mapa průchodnosti (F3)</button>
           <button id="btn-options-back">OK</button>
+        </div>
+        <div class="menu-view" id="menu-save" hidden>
+          <h2>Uložit hru</h2>
+          <div class="save-list" id="save-list-save"></div>
+          <label>Název <input type="text" id="save-name" maxlength="40" /></label>
+          <button id="btn-save-do">Uložit</button>
+          <button id="btn-save-back">Zpět</button>
+        </div>
+        <div class="menu-view" id="menu-load" hidden>
+          <h2>Nahrát hru</h2>
+          <div class="save-list" id="save-list-load"></div>
+          <button id="btn-load-back">Zpět</button>
         </div>
         <div class="menu-view" id="menu-end" hidden>
           <h2>Ukončit hru</h2>

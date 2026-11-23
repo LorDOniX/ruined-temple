@@ -30,9 +30,9 @@ export const TILE_STYLES: Record<string, TileStyle> = {
   Zvin: { name: 'Dark Grass', file: 'TerrainArt\\Ruins\\Ruins_GrassDark', base: [44, 78, 38], accent: [30, 60, 28], pattern: 'grass' },
 };
 
-export const CLIFF_STYLES: Record<string, TileStyle & { groundTile: string; modelDir: string }> = {
-  CZdi: { name: 'Dirt Cliff', file: 'ReplaceableTextures\\Cliff\\Cliff0', base: [104, 86, 66], accent: [70, 58, 46], pattern: 'rock', groundTile: 'Zdrt', modelDir: 'Cliffs' },
-  CZlb: { name: 'Large Bricks Cliff', file: 'ReplaceableTextures\\Cliff\\Cliff1', base: [120, 114, 100], accent: [76, 72, 64], pattern: 'bricksLarge', groundTile: 'Zbkl', modelDir: 'CityCliffs' },
+export const CLIFF_STYLES: Record<string, TileStyle & { groundTile: string; modelDir: string; rampDir: string }> = {
+  CZdi: { name: 'Dirt Cliff', file: 'ReplaceableTextures\\Cliff\\Cliff0', base: [104, 86, 66], accent: [70, 58, 46], pattern: 'rock', groundTile: 'Zdrt', modelDir: 'Cliffs', rampDir: 'CliffTrans' },
+  CZlb: { name: 'Large Bricks Cliff', file: 'ReplaceableTextures\\Cliff\\Cliff1', base: [120, 114, 100], accent: [76, 72, 64], pattern: 'bricksLarge', groundTile: 'Zbkl', modelDir: 'CityCliffs', rampDir: 'CityCliffTrans' },
 };
 
 export const BLIGHT_STYLE: TileStyle = { name: 'Blight', file: 'TerrainArt\\Blight\\Ruins_Blight', base: [70, 60, 78], accent: [40, 34, 46], pattern: 'blight' };

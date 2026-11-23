@@ -244,10 +244,18 @@ export class DecalLayer {
     return pos;
   }
 
+  /** Ground area in view (with a margin); decals outside are not rebuilt or drawn. Null = everything. */
+  viewRect: { minX: number; minY: number; maxX: number; maxY: number } | null = null;
+
   private draw() {
     const groups = new Map<Batch, Decal[]>();
+    const r = this.viewRect;
     for (const d of this.decals) {
       if (!d.visible || !d.texture || d.color[3] <= 0.001) continue;
+      if (r) {
+        const ext = Math.max(d.halfW, d.halfH) * 1.5;
+        if (d.x + ext < r.minX || d.x - ext > r.maxX || d.y + ext < r.minY || d.y - ext > r.maxY) continue;
+      }
       const b = this.batch(d);
       let list = groups.get(b);
       if (!list) groups.set(b, (list = []));
