@@ -1,5 +1,25 @@
 import * as THREE from 'three';
+import { clone as skeletonClone } from 'three/examples/jsm/utils/SkeletonUtils.js';
 import type { AssetCatalog } from '../data/types';
+
+/**
+ * Copy of a loaded model (rebinds skinned meshes to the cloned bones). three.js deep-copies userData through
+ * JSON.parse(JSON.stringify()) when cloning; the template's userData holds emitter definitions with their
+ * DataTextures and raw MDX parser objects, so a plain clone serialized whole textures (Array.from of megabytes of
+ * pixels) for every spawned unit, missile or effect – a visible hitch. The copy gets a shallow copy instead
+ * (the definitions are read-only and shared with the template).
+ */
+export function cloneModel<T extends THREE.Object3D>(template: T, skinned = true): T {
+  const data = template.userData;
+  template.userData = {};
+  try {
+    const copy = (skinned ? skeletonClone(template) : template.clone()) as T;
+    copy.userData = { ...data };
+    return copy;
+  } finally {
+    template.userData = data;
+  }
+}
 
 /**
  * Loads original Warcraft 3 MDX models + BLP textures from public/war3 (created by tools/assets.ts)
@@ -70,7 +90,10 @@ export class Wc3Assets {
     const cacheKey = `${key}|${tags.join(',')}`;
     let p = this.models.get(cacheKey);
     if (!p) {
-      p = this.doLoadModel(`${key}.mdx`, tags).catch((e) => {
+      p = this.doLoadModel(`${key}.mdx`, tags).then(async (g) => {
+        if (g && this.prepare) await this.prepare(g).catch(() => undefined);
+        return g;
+      }).catch((e) => {
         console.warn('MDX load failed', path, e);
         return null;
       });
@@ -106,12 +129,21 @@ export class Wc3Assets {
       const blob = await (await fetch(this.url(`${base}.png`))).blob();
       const bmp = await createImageBitmap(blob, { premultiplyAlpha: 'none', colorSpaceConversion: 'none' });
       const canvas = new OffscreenCanvas(bmp.width, bmp.height);
-      const ctx = canvas.getContext('2d')!;
+      // willReadFrequently keeps the canvas in CPU memory: a GPU canvas makes getImageData a slow synchronous readback.
+      const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
       ctx.drawImage(bmp, 0, 0);
-      return ctx.getImageData(0, 0, bmp.width, bmp.height);
+      bmp.close();
+      return ctx.getImageData(0, 0, canvas.width, canvas.height);
     }
     return null;
   }
+
+  /**
+   * Warm-up of a newly loaded model before it is handed out (main.ts: WebGLRenderer.compileAsync). Shader programs
+   * are then compiled in parallel (KHR_parallel_shader_compile) instead of stalling the first frame that draws
+   * the model – e.g. the first tower of a kind or a new creep type.
+   */
+  prepare: ((model: THREE.Group) => Promise<unknown>) | null = null;
 
   /** Texture quality option: 1 = model textures at half resolution (low), 0 = full (the HUD keeps full icons). */
   textureLevel = 0;

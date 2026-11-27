@@ -1,5 +1,4 @@
 {
-  "assets/index-CK8meswm.js": "ac81445e08df4cee4fd212d019660639",
   "assets/index-Dr0w6WUr.css": "a676c6bd66cfc899b2c56e4033381311",
   "assets/mdx-parsers-BvAjIS2T.js": "73a1c916c785e540147b254d20db310f",
   "assets/rolldown-runtime-WkwZ5CU-.js": "6feff7033e022add131d7bf11f6a4241",
@@ -1465,6 +1464,7 @@
   "war3/units/undead/shade/shadeyes4.wav": "c36b3d00ab86fe2bae9257e555adc2ef",
   "war3/units/undead/skeleton/skeletondeath1.wav": "e7bc7dae589e95d397b249d3bf1bb40c",
   "war3/units/undead/skeleton/skeletonwhat3.wav": "0c0a372189a94a514daaa200777e5ea8",
-  "index.html": "44f7760635a64178cd7306e7a6711084",
-  ".htaccess": "271f99c0c02909f78a95244bcf043891"
+  "index.html": "9f0c680ccec40fcb51919a0a3fe5f93e",
+  ".htaccess": "271f99c0c02909f78a95244bcf043891",
+  "assets/index-BiXveJJ3.js": "7608599339de59853d918c14573bd494"
 }

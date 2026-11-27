@@ -1,7 +1,6 @@
 import * as THREE from 'three';
-import { clone as cloneSkinned } from 'three/examples/jsm/utils/SkeletonUtils.js';
 import type { Unit } from '../game/game';
-import { applyTeamColor, pickPortraitSequence, type ModelCamera, type Wc3Assets, startGlobalClips } from './mdx';
+import { applyTeamColor, cloneModel, pickPortraitSequence, type ModelCamera, type Wc3Assets, startGlobalClips } from './mdx';
 
 /**
  * The animated unit portrait of the console: "<model>_portrait.mdx" (or the unit model itself) playing its
@@ -41,7 +40,7 @@ export class PortraitView {
     const tags = String(u.def.fields.uani ?? '').toLowerCase().split(',').map((s) => s.trim()).filter(Boolean);
     void this.assets.loadModel(path, tags.join(',')).then((model) => {
       if (!model || this.key !== key) return;
-      const m = cloneSkinned(model);
+      const m = cloneModel(model);
       applyTeamColor(this.assets!, m, u.owner);
       this.root.add(m);
       this.modelCamera = (model.userData.camera as ModelCamera | undefined) ?? null;

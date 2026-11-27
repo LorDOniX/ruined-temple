@@ -16,6 +16,7 @@ import { GameCursor, type CursorTint } from './ui/cursor';
 import { GameMenu, decodeKeysFile, savedSettings } from './ui/menu';
 import { takePendingLoad } from './ui/saves';
 import { DayNight } from './render/daynight';
+import { mat } from './render/placeholders';
 
 async function loadJson<T>(url: string): Promise<T | null> {
   try {
@@ -568,8 +569,26 @@ async function main() {
     cursor.update(dt);
   };
 
+  // Shader warm-up behind the loading screen: hidden objects (HP bars of units at full health, selection circles …)
+  // and translucent untextured placeholders (planned buildings) would otherwise compile their programs the first
+  // time they show up during the game, typically when the first building is ordered. compileAsync() also covers
+  // hidden objects and waits until the driver has finished the programs (a program left unfinished is completed
+  // synchronously on its first draw).
+  const warmUp = new THREE.Group();
+  warmUp.add(new THREE.Sprite(new THREE.SpriteMaterial({ depthTest: false })), new THREE.Mesh(new THREE.BoxGeometry(), mat(0xffffff, { opacity: 0.5 })));
+  scene.add(warmUp);
+  await renderer.compileAsync(scene, cam.camera);
+  renderer.render(scene, cam.camera);
+  scene.remove(warmUp);
+  // The custom shaders (terrain) have now been checked on their first draw. Further programs come from built-in
+  // materials only; their check (getProgramInfoLog etc.) is a synchronous round trip to the GPU process that
+  // stalls the frame drawing a new model, so it is turned off.
+  renderer.debug.checkShaderErrors = false;
+
   stage('Hotovo');
   loadingEl().hidden = true;
+  // Models loaded during the game get their shaders compiled in the background before they are first drawn.
+  if (assets) assets.prepare = (m) => renderer.compileAsync(m, cam.camera, scene);
 
   // --- day / night (Environment\\DNC): the calibrated noon lighting is multiplied by the DNC colours -------------
   const dayNight = assets && catalog?.ui?.dnc ? await DayNight.load(assets, catalog.ui.dnc.terrain, catalog.ui.dnc.unit) : null;

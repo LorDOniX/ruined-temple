@@ -307,7 +307,8 @@ export class Hud {
         cv.width = img.width;
         cv.height = img.height;
         cv.getContext('2d')!.putImageData(img, 0, 0);
-        return cv.toDataURL();
+        // toBlob encodes off the main thread (toDataURL blocks a frame for every new icon); icons are kept for the session.
+        return new Promise<string | null>((resolve) => cv.toBlob((b) => resolve(b ? URL.createObjectURL(b) : null)));
       });
       this.icons.set(key, p);
     }

@@ -3,8 +3,7 @@ import type { AssetCatalog, MapData } from '../data/types';
 import type { ObjectDB } from '../data/objects';
 import { CREEP_PLAYER, PLAYER_COLORS, attackColor, type Destructable, type Game, type Missile, type Unit } from '../game/game';
 import { TerrainGrid } from './terrain';
-import { clone as cloneSkinned } from 'three/examples/jsm/utils/SkeletonUtils.js';
-import { MaterialAnimator, Wc3Assets, sequenceVariants, startGlobalClips, applyReplaceable, applyTeamColor, instantiate, pickSequence, type ModelAnimations, type SequenceInfo } from './mdx';
+import { MaterialAnimator, Wc3Assets, cloneModel, sequenceVariants, startGlobalClips, applyReplaceable, applyTeamColor, instantiate, pickSequence, type ModelAnimations, type SequenceInfo } from './mdx';
 import { ParticleSystem, type ModelEvent, type ModelParticle } from './particles';
 import { DecalLayer, type Decal } from './decals';
 import type { LoopHandle, SoundPlayer } from '../sound';
@@ -230,7 +229,7 @@ export class WorldView {
     if (!template) return;
     let model = template;
     if (info.texId && info.texFile) {
-      model = model.clone();
+      model = cloneModel(model, false);
       await applyReplaceable(this.assets, model, info.texId, info.texFile);
     }
     let inst: THREE.Object3D;
@@ -238,7 +237,7 @@ export class WorldView {
       // Moving parts / emitters (fires, smoke, flies, totems): individual animated copies with a random phase.
       inst = new THREE.Group();
       for (const mtx of matrices) {
-        const c = cloneSkinned(model);
+        const c = cloneModel(model);
         c.applyMatrix4(mtx);
         inst.add(c);
         this.animatedProp(template, c, true);
@@ -267,7 +266,7 @@ export class WorldView {
       const info = this.db.doodadModel(d.id);
       const model = info && (await this.assets.loadModel(info.file));
       if (model) {
-        const m = cloneSkinned(model);
+        const m = cloneModel(model);
         if (info.texId && info.texFile) await applyReplaceable(this.assets!, m, info.texId, info.texFile);
         g.clear();
         g.add(m);
@@ -437,7 +436,7 @@ export class WorldView {
     view.body.clear();
     view.body.position.z = 0;
     // SkeletonUtils.clone rebinds the skinned meshes to the cloned bones.
-    const m = cloneSkinned(model);
+    const m = cloneModel(model);
     m.scale.setScalar(def.scale);
     applyTeamColor(this.assets, m, this.colorOf(u.owner));
     view.body.add(m);
@@ -666,7 +665,7 @@ export class WorldView {
       });
     } else if (want.includes('overhead') || want.includes('head')) z = v.height + 10;
     else if (want.includes('chest')) z = v.height * 0.6;
-    const fx = cloneSkinned(template);
+    const fx = cloneModel(template);
     fx.position.z = z;
     // Bones carry the unit's model scale; effects keep their own size.
     if (parent !== v.body) fx.scale.setScalar(1 / Math.max(0.1, u.def.scale));
@@ -775,7 +774,7 @@ export class WorldView {
       return null;
     }
     if (!t || t === 'loading') return null;
-    const obj = cloneSkinned(t);
+    const obj = cloneModel(t);
     const info = this.assets!.animations(t);
     const seq = info?.sequences[0];
     if (!info || !seq) return { obj, update: () => {} };
@@ -795,7 +794,7 @@ export class WorldView {
     const start = this.clock;
     void this.assets.loadModel(path).then((model) => {
       if (!model) return;
-      const m = cloneSkinned(model);
+      const m = cloneModel(model);
       m.position.set(x, y, z);
       m.rotation.z = yaw;
       const info = this.assets!.animations(model);
@@ -841,7 +840,7 @@ export class WorldView {
     }
     void this.assets.loadModel(path).then((model) => {
       if (!model || !obj.parent) return;
-      const inst = cloneSkinned(model);
+      const inst = cloneModel(model);
       applyTeamColor(this.assets!, inst, this.colorOf(mv.owner));
       obj.add(inst);
       this.matAnim.register(inst, () => (mv.state.seq && mv.state.action ? { interval: mv.state.seq.interval, frame: mv.state.seq.interval[0] + mv.state.action.time * 1000 } : null), model.userData.globals ?? []);
@@ -895,7 +894,7 @@ export class WorldView {
     const start = this.clock;
     void this.assets.loadModel(path).then((model) => {
       if (!model) return;
-      const m = cloneSkinned(model);
+      const m = cloneModel(model);
       m.position.set(x, y, z);
       m.traverse((o) => {
         const mesh = o as THREE.Mesh;
@@ -1117,7 +1116,7 @@ export class WorldView {
     const tags = String(def.fields.uani ?? '');
     void this.assets.loadModel(def.model, tags).then((model) => {
       if (!model) return;
-      const m = cloneSkinned(model);
+      const m = cloneModel(model);
       m.scale.setScalar(def.scale);
       m.traverse((o) => {
         const mesh = o as THREE.Mesh;
