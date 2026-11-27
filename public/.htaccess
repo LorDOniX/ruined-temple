@@ -1,0 +1,7 @@
+# pristup jen s heslem (HTTP Basic Auth), plati i pro podslozky (data hry, hd/, ...)
+# spolecny soubor s hesly pro app.makuderovi.cz je mimo web i mimo git: FTP /.htpasswd, nahrava se rucne (viz README)
+# bez "RewriteEngine On" - jinak by se ve slozce prestala uplatnovat pravidla /www/subdom/app/.htaccess (makuderovi/docs/app.md)
+AuthType Basic
+AuthName "app.makuderovi.cz"
+AuthUserFile /data/web/virtuals/307882/virtual/.htpasswd
+Require valid-user

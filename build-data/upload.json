@@ -1465,5 +1465,6 @@
   "war3/units/undead/shade/shadeyes4.wav": "c36b3d00ab86fe2bae9257e555adc2ef",
   "war3/units/undead/skeleton/skeletondeath1.wav": "e7bc7dae589e95d397b249d3bf1bb40c",
   "war3/units/undead/skeleton/skeletonwhat3.wav": "0c0a372189a94a514daaa200777e5ea8",
-  "index.html": "44f7760635a64178cd7306e7a6711084"
+  "index.html": "44f7760635a64178cd7306e7a6711084",
+  ".htaccess": "271f99c0c02909f78a95244bcf043891"
 }

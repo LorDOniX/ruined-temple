@@ -26,3 +26,16 @@ npm run dev        # http://127.0.0.1:5199
 - balíček [`wedos-upload`](https://github.com/LorDOniX/wedos-upload), cíl v `package.json` pod klíčem `wedosUpload`, přístup na FTP v proměnných prostředí `WEDOS_FTP_HOST`, `WEDOS_FTP_USER`, `WEDOS_FTP_PASSWORD`
 - nahrávají se jen změněné soubory (stav serveru v `build-data/upload.json`, patří do gitu); `npx wedos-upload --dry-run` vypíše změny, `--full` nahraje vše
 - pozor: volitelná originální data `public/war3/` (Warcraft III) by se s buildem nahrála veřejně
+
+### Přístup za heslem
+
+Web je za heslem (HTTP Basic Auth), heslo platí i pro podsložky s daty. Pravidla jsou v ``public/.htaccess`` (build je kopíruje do `dist/.htaccess`), soubor s hesly je společný pro chráněné stránky na app.makuderovi.cz, je mimo web i mimo git a nahrává se ručně na FTP jako `/.htpasswd` (na serveru `/data/web/virtuals/307882/virtual/.htpasswd`):
+
+```sh
+printf 'roman:%s\n' "$(openssl passwd -apr1)" > .htpasswd   # zeptá se na heslo; další uživatel = další řádek
+# .htpasswd nahrát přes FTP do kořene (/.htpasswd, vedle složky www) a lokální soubor smazat
+```
+
+- ověření po uploadu: `curl -sI https://app.makuderovi.cz/ruined-temple/ | head -1` → `401` (bez hesla), `curl -sI -u roman https://app.makuderovi.cz/ruined-temple/ | head -1` → `200`
+- `500` znamená špatnou cestu v `AuthUserFile`
+- v `.htaccess` nesmí být `RewriteEngine On` (`makuderovi/docs/app.md`)
